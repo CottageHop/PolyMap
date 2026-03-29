@@ -1,0 +1,47 @@
+{
+  "name": "polymap",
+  "version": "0.1.0",
+  "description": "3D map renderer with WebGPU - JS library and Vue component",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "exports": {
+    ".": {
+      "import": "./src/index.js"
+    },
+    "./polymap": {
+      "import": "./src/polymap.js"
+    },
+    "./vue": {
+      "import": "./src/PolyMap.vue"
+    }
+  },
+  "files": [
+    "src/"
+  ],
+  "peerDependencies": {
+    "vue": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vue": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "map",
+    "3d",
+    "webgpu",
+    "wasm",
+    "vue",
+    "openstreetmap"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CottageHop/PolyMap"
+  },
+  "bugs": {
+    "url": "https://github.com/CottageHop/PolyMap/issues"
+  },
+  "homepage": "https://github.com/CottageHop/PolyMap#readme"
+}

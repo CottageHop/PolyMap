@@ -1,0 +1,14 @@
+/target
+/polymap-worker/target
+/pkg
+/web/pkg
+/js/pkg
+/polymap-worker/pkg
+node_modules/
+.DS_Store
+*.swp
+*.swo
+*~
+.env
+.env.local
+.claude/
