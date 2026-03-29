@@ -44,6 +44,10 @@ pub enum Command {
         labels_json: String,
         z14_tile: String,
     },
+    TileFailed {
+        col: i32,
+        row: i32,
+    },
 }
 
 /// Camera state readable from JS without a round-trip.
@@ -312,5 +316,12 @@ impl PolyMap {
             labels_json: labels_json.to_string(),
             z14_tile: z14_tile.to_string(),
         });
+    }
+
+    /// Notify WASM that a worker tile fetch failed or returned empty.
+    /// Decrements the in-flight counter so new tiles can be requested.
+    #[wasm_bindgen(js_name = notifyTileFailed)]
+    pub fn notify_tile_failed(&self, col: i32, row: i32) {
+        push_command(Command::TileFailed { col, row });
     }
 }

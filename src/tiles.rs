@@ -324,6 +324,11 @@ impl TileManager {
         }
     }
 
+    /// Record a tile failure with exponential backoff (public for worker error path).
+    pub fn record_failure_pub(&mut self, coord: TileCoord) {
+        self.record_failure(coord);
+    }
+
     /// Record a tile failure with exponential backoff.
     fn record_failure(&mut self, coord: TileCoord) {
         let retries = self.fail_counts.entry(coord).or_insert(0);

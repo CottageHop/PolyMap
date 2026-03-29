@@ -98,20 +98,22 @@ export async function createPolyMap(container, options = {}) {
       }
       w.busy = false;
 
-      if (type === 'result' && id != null) {
-        const tile = pendingTiles.get(id);
-        pendingTiles.delete(id);
-        if (tile && !empty && vertices && indices) {
-          wasmMap.pushTileData(
-            tile.col, tile.row,
-            new Float32Array(vertices.buffer || vertices),
-            new Uint32Array(indices.buffer || indices),
-            new Float32Array(shadowVertices?.buffer || shadowVertices || []),
-            new Uint32Array(shadowIndices?.buffer || shadowIndices || []),
-            labels || '[]',
-            z14Tile || '0,0',
-          );
-        }
+      const tile = id != null ? pendingTiles.get(id) : null;
+      if (tile) pendingTiles.delete(id);
+
+      if (type === 'result' && tile && !empty && vertices && indices) {
+        wasmMap.pushTileData(
+          tile.col, tile.row,
+          new Float32Array(vertices.buffer || vertices),
+          new Uint32Array(indices.buffer || indices),
+          new Float32Array(shadowVertices?.buffer || shadowVertices || []),
+          new Uint32Array(shadowIndices?.buffer || shadowIndices || []),
+          labels || '[]',
+          z14Tile || '0,0',
+        );
+      } else if (tile) {
+        // Empty or failed — release the in-flight slot
+        wasmMap.notifyTileFailed(tile.col, tile.row);
       }
 
       // Process queued work
