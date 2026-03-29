@@ -96,6 +96,7 @@ impl Camera {
         // Shift so the world point under the cursor stays put
         self.target_position += pixel_offset * (old_scale - new_scale);
         self.target_zoom = new_zoom;
+        self.dirty = true;
     }
 
     /// How many world units one pixel represents at a given zoom level
@@ -106,12 +107,14 @@ impl Camera {
     /// Tilt the camera. Positive = more tilted (toward horizon).
     pub fn tilt_by(&mut self, delta: f32) {
         self.target_tilt = (self.target_tilt + delta).clamp(0.4, 1.5);
+        self.dirty = true;
     }
 
     /// Pan the camera by a pixel offset (converted to world space)
     pub fn pan_by(&mut self, pixel_delta: Vec2) {
         let world_scale = self.world_units_per_pixel();
         self.target_position -= Vec2::new(pixel_delta.x, -pixel_delta.y) * world_scale;
+        self.dirty = true;
     }
 
     /// How many world units one pixel represents at current zoom
@@ -219,11 +222,13 @@ impl Camera {
     /// Set the target zoom for smooth zooming.
     pub fn set_target_zoom(&mut self, zoom: f32) {
         self.target_zoom = zoom.clamp(-2.0, 2.5);
+        self.dirty = true;
     }
 
     /// Set the target tilt for smooth tilting.
     pub fn set_target_tilt(&mut self, tilt: f32) {
         self.target_tilt = tilt.clamp(0.4, 1.5);
+        self.dirty = true;
     }
 
     /// Unproject screen pixel coordinates to world XY (at z=0 plane).

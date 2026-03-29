@@ -147,76 +147,8 @@
             pmtiles_url: PMTILES_URL,
         });
 
-        // ── Web Worker pool for off-thread tile processing ───────────
-        const workerCount = Math.min(navigator.hardwareConcurrency || 4, 4);
-        const workers = [];
-        const pendingTiles = new Map();
-        let tileIdCounter = 0;
-        const tileQueue = [];
-
-        function drainQueue() {
-            while (tileQueue.length > 0) {
-                const idle = workers.find(w => !w.busy);
-                if (!idle) break;
-                const job = tileQueue.shift();
-                idle.busy = true;
-                idle.postMessage(job);
-            }
-        }
-
-        for (let i = 0; i < workerCount; i++) {
-            const w = new Worker('./tile-worker.js', { type: 'module' });
-            w.busy = false;
-            w.onmessage = (e) => {
-                const { type, id, error, empty, vertices, indices,
-                        shadowVertices, shadowIndices, labels, z14Tile } = e.data;
-                if (type === 'ready') return;
-                if (type === 'error') console.warn('[TileWorker]', error);
-                w.busy = false;
-
-                if (type === 'result' && id != null) {
-                    const tile = pendingTiles.get(id);
-                    pendingTiles.delete(id);
-                    if (tile && !empty && vertices && indices) {
-                        map.pushTileData(
-                            tile.col, tile.row,
-                            new Float32Array(vertices.buffer || vertices),
-                            new Uint32Array(indices.buffer || indices),
-                            new Float32Array(shadowVertices?.buffer || shadowVertices || []),
-                            new Uint32Array(shadowIndices?.buffer || shadowIndices || []),
-                            labels || '[]',
-                            z14Tile || '0,0',
-                        );
-                    }
-                }
-                drainQueue();
-            };
-            w.postMessage({ type: 'init' });
-            workers.push(w);
-        }
-
-        // Wire tile callback so WASM dispatches to workers
-        map.setTileCallback((col, row, south, west, north, east, centerLat, centerLon, detail) => {
-            const id = tileIdCounter++;
-            pendingTiles.set(id, { col, row });
-
-            const midLat = (south + north) / 2;
-            const midLon = (west + east) / 2;
-            const z = 14;
-            const n = Math.pow(2, z);
-            const tx = Math.floor((midLon + 180) / 360 * n);
-            const latRad = midLat * Math.PI / 180;
-            const ty = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
-
-            const job = { type: 'process', id, url: PMTILES_URL, z, tx, ty, centerLat, centerLon, detail };
-            const idle = workers.find(w => !w.busy);
-            if (idle) {
-                idle.busy = true;
-                idle.postMessage(job);
-            } else {
-                tileQueue.push(job);
-            }
-        });
+        // No Web Workers — tiles load on main thread via WASM's built-in
+        // PMTiles reader (uses the pmtiles_url from config above).
 
         // Listen for events
         map.on("ready", () => {

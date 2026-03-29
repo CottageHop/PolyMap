@@ -56,7 +56,7 @@ serve: build-web
 		$(MAKE) download-tiles; \
 	fi
 	@echo "Serving at http://localhost:8080"
-	cd web && python3 -m http.server 8080
+	cd web && python3 server.py 8080
 
 # Type-check both crates
 check:

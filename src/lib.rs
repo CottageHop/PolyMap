@@ -353,6 +353,13 @@ impl App {
                             }
                         }
                     }
+                    api::Command::TileFailed { col, row } => {
+                        if let Some(tm) = &mut self.tile_manager {
+                            let coord = tiles::TileCoord { col, row };
+                            tm.decrement_in_flight();
+                            tm.record_failure_pub(coord);
+                        }
+                    }
                 }
         }
     }
