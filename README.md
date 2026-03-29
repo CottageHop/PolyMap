@@ -1,5 +1,7 @@
 # PolyMap [Experimental]
 
+![PolyMap — 3D OpenStreetMap rendering](https://raw.githubusercontent.com/CottageHop/PolyMap/assets/polymap-hero.png)
+
 A 3D map renderer powered by WebGPU and Rust/WASM. Renders OpenStreetMap data as textured 3D geometry with buildings, roads, parks, water, trees, and labels — directly in the browser.
 
 ## Features
