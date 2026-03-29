@@ -82,11 +82,27 @@
             box-shadow: 0 1px 4px rgba(0,0,0,0.1);
         }
         #controls button:hover { background: #f5f5f5; }
+
+        #attribution {
+            position: absolute;
+            bottom: 4px;
+            right: 8px;
+            font-size: 11px;
+            color: #666;
+            background: rgba(255,255,255,0.7);
+            padding: 2px 6px;
+            border-radius: 3px;
+            z-index: 30;
+        }
+        #attribution a { color: #0078a8; text-decoration: none; }
+        #attribution a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
     <canvas id="polymap-canvas"></canvas>
     <div id="markers"></div>
+
+    <div id="attribution">&copy; <a href="https://openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors | <a href="https://protomaps.com" target="_blank">Protomaps</a></div>
 
     <div id="controls">
         <button onclick="map.setTilt(0.3)">Tilt More</button>
@@ -100,6 +116,12 @@
 
     <script type="module">
         import init, { PolyMap } from './pkg/polymap.js';
+
+        // ── Configuration ────────────────────────────────────────────
+        // Protomaps daily build — contains OpenStreetMap data in PMTiles format.
+        // Replace with your own hosted PMTiles URL for production use.
+        // See: https://docs.protomaps.com/basemaps/downloads
+        const PMTILES_URL = './tiles.pmtiles';
 
         // Ensure canvas has pixel dimensions before WASM init
         const canvas = document.getElementById('polymap-canvas');
@@ -115,11 +137,85 @@
         window.labelsVisible = true;
 
         // Create the map with configuration
+        // pmtiles_url is passed so the WASM main-thread fallback works
+        // even if workers fail to load.
         window.map = new PolyMap({
             canvas: "#polymap-canvas",
             center: { lat: 40.765, lon: -73.980 },
             zoom: 0.8,
             tilt: 1.35,
+            pmtiles_url: PMTILES_URL,
+        });
+
+        // ── Web Worker pool for off-thread tile processing ───────────
+        const workerCount = Math.min(navigator.hardwareConcurrency || 4, 4);
+        const workers = [];
+        const pendingTiles = new Map();
+        let tileIdCounter = 0;
+        const tileQueue = [];
+
+        function drainQueue() {
+            while (tileQueue.length > 0) {
+                const idle = workers.find(w => !w.busy);
+                if (!idle) break;
+                const job = tileQueue.shift();
+                idle.busy = true;
+                idle.postMessage(job);
+            }
+        }
+
+        for (let i = 0; i < workerCount; i++) {
+            const w = new Worker('./tile-worker.js', { type: 'module' });
+            w.busy = false;
+            w.onmessage = (e) => {
+                const { type, id, error, empty, vertices, indices,
+                        shadowVertices, shadowIndices, labels, z14Tile } = e.data;
+                if (type === 'ready') return;
+                if (type === 'error') console.warn('[TileWorker]', error);
+                w.busy = false;
+
+                if (type === 'result' && id != null) {
+                    const tile = pendingTiles.get(id);
+                    pendingTiles.delete(id);
+                    if (tile && !empty && vertices && indices) {
+                        map.pushTileData(
+                            tile.col, tile.row,
+                            new Float32Array(vertices.buffer || vertices),
+                            new Uint32Array(indices.buffer || indices),
+                            new Float32Array(shadowVertices?.buffer || shadowVertices || []),
+                            new Uint32Array(shadowIndices?.buffer || shadowIndices || []),
+                            labels || '[]',
+                            z14Tile || '0,0',
+                        );
+                    }
+                }
+                drainQueue();
+            };
+            w.postMessage({ type: 'init' });
+            workers.push(w);
+        }
+
+        // Wire tile callback so WASM dispatches to workers
+        map.setTileCallback((col, row, south, west, north, east, centerLat, centerLon, detail) => {
+            const id = tileIdCounter++;
+            pendingTiles.set(id, { col, row });
+
+            const midLat = (south + north) / 2;
+            const midLon = (west + east) / 2;
+            const z = 14;
+            const n = Math.pow(2, z);
+            const tx = Math.floor((midLon + 180) / 360 * n);
+            const latRad = midLat * Math.PI / 180;
+            const ty = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+
+            const job = { type: 'process', id, url: PMTILES_URL, z, tx, ty, centerLat, centerLon, detail };
+            const idle = workers.find(w => !w.busy);
+            if (idle) {
+                idle.busy = true;
+                idle.postMessage(job);
+            } else {
+                tileQueue.push(job);
+            }
         });
 
         // Listen for events
