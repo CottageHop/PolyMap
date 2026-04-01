@@ -56,6 +56,7 @@ pub struct LayerConfig {
     pub shadows: Option<bool>,
     pub labels: Option<bool>,
     pub parcels: Option<bool>,
+    pub clouds: Option<bool>,
 }
 
 /// Runtime layer visibility state.
@@ -69,6 +70,7 @@ pub struct LayerVisibility {
     pub shadows: bool,
     pub labels: bool,
     pub parcels: bool,
+    pub clouds: bool,
 }
 
 impl Default for LayerVisibility {
@@ -82,6 +84,7 @@ impl Default for LayerVisibility {
             shadows: true,
             labels: true,
             parcels: true,
+            clouds: true,
         }
     }
 }
@@ -96,5 +99,6 @@ impl LayerVisibility {
         if let Some(v) = config.shadows { self.shadows = v; }
         if let Some(v) = config.labels { self.labels = v; }
         if let Some(v) = config.parcels { self.parcels = v; }
+        if let Some(v) = config.clouds { self.clouds = v; }
     }
 }

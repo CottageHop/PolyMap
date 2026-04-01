@@ -8,7 +8,16 @@ struct CameraUniform {
     zoom: f32,
     time: f32,
     tilt: f32,
-    _padding: f32,
+    cloud_opacity: f32,
+    cloud_speed: f32,
+    _pad2a: f32,
+    _pad2b: f32,
+    _pad2c: f32,
+    water_tint: vec4<f32>,
+    park_tint: vec4<f32>,
+    building_tint: vec4<f32>,
+    road_tint: vec4<f32>,
+    land_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -228,6 +237,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mat = i32(round(in.material));
     var color = in.color.rgb;
 
+    // Apply dashboard color overrides.
+    // Check specific materials first, then fall through to land for everything else.
+    let orig_lum = dot(color, vec3<f32>(0.299, 0.587, 0.114));
+    let is_water = mat == 4 || mat == 11;
+    let is_park = mat == 3 || mat == 6;
+    let is_building = mat == 2 || mat == 5 || mat == 9 || mat == 10;
+    let is_road = mat == 1 || mat == 8;
+    let is_land = !is_water && !is_park && !is_building && !is_road
+                  && mat != 12 && mat != 13; // exclude clouds and pins
+
+    if camera.water_tint.a > 0.5 && is_water {
+        color = camera.water_tint.rgb;
+    } else if camera.park_tint.a > 0.5 && is_park {
+        color = camera.park_tint.rgb;
+    } else if camera.building_tint.a > 0.5 && is_building {
+        let tint = camera.building_tint.rgb;
+        if mat == 5 || mat == 10 {
+            let tint_lum = max(dot(tint, vec3<f32>(0.299, 0.587, 0.114)), 0.01);
+            color = tint * (orig_lum / tint_lum);
+        } else {
+            color = tint;
+        }
+    } else if camera.road_tint.a > 0.5 && is_road {
+        color = camera.road_tint.rgb;
+    } else if camera.land_tint.a > 0.5 && is_land {
+        color = camera.land_tint.rgb;
+    }
+
     // Procedural materials
     switch mat {
         case 5: {
@@ -293,17 +330,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let sparkle_uv = uv * 20.0 + vec2<f32>(t * 2.0, t * 1.5);
             let sparkle = smoothstep(0.85, 0.95, noise2(sparkle_uv)) * 0.15;
 
-            color = color + vec3<f32>(wave1 + wave2 + wave3 + caustic);
-            color = color + vec3<f32>(cloud_reflect); // white cloud reflections
-            color = color + vec3<f32>(sparkle * 0.7, sparkle * 0.85, sparkle); // blue-white sparkle
+            let wave_n = wave1 + wave2 + wave3 + caustic;
+            let spark_n = sparkle + cloud_reflect;
+            if camera.water_tint.a > 0.5 {
+                // Scale effects by tint brightness so dark water stays dark
+                let brightness = dot(camera.water_tint.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                let effect_scale = clamp(brightness * 2.0, 0.05, 1.0);
+                color = color + vec3<f32>((wave_n + spark_n) * effect_scale);
+            } else {
+                color = color + vec3<f32>(wave_n);
+                color = color + vec3<f32>(cloud_reflect);
+                color = color + vec3<f32>(sparkle * 0.7, sparkle * 0.85, sparkle);
+            }
         }
         case 3: {
-            // Grass/park — organic variation
+            // Grass/park — organic variation (skip green bias when tinted)
             let uv = in.world_pos.xy;
             let grass1 = fbm3(uv * 8.0) * 0.06;
             let grass2 = noise2(uv * 25.0) * 0.03;
             let clump = smoothstep(0.4, 0.6, noise2(uv * 4.0)) * 0.04;
-            color = color + vec3<f32>(grass1 * 0.5, grass1 + grass2 + clump, grass1 * 0.3);
+            if camera.park_tint.a > 0.5 {
+                // Neutral noise — no green bias
+                let n = grass1 + grass2 * 0.5 + clump * 0.5;
+                color = color + vec3<f32>(n, n, n);
+            } else {
+                color = color + vec3<f32>(grass1 * 0.5, grass1 + grass2 + clump, grass1 * 0.3);
+            }
         }
         case 1: {
             // Asphalt roads — subtle grain
@@ -331,7 +383,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Screen-space edge fog — based on distance from screen center (NDC space)
     // This makes fog independent of world position — it's a viewport vignette
-    let fog_color = vec3<f32>(0.95, 0.90, 0.85); // warm cream fog matching cottagecore land
+    var fog_color = vec3<f32>(0.95, 0.90, 0.85); // warm cream fog matching cottagecore land
+    if camera.land_tint.a > 0.5 {
+        fog_color = camera.land_tint.rgb;
+    }
     let ndc = in.clip_position.xy / camera.viewport * 2.0 - 1.0; // -1..1 screen space
     let screen_dist = length(ndc); // 0 at center, ~1.4 at corners
     let fog_factor = smoothstep(0.85, 1.3, screen_dist) * 0.7; // starts near edge, 70% at corners
@@ -357,57 +412,72 @@ fn fs_shadow(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 // ============================================================
-//  Billboard cloud sprite shader (texture atlas)
+//  Procedural fullscreen cloud overlay
+//  One fullscreen triangle — all cloud logic in the fragment shader.
 // ============================================================
 
-// Cloud texture atlas bind group
-@group(1) @binding(0)
-var cloud_texture: texture_2d<f32>;
-@group(1) @binding(1)
-var cloud_sampler: sampler;
-
-struct CloudVertexInput {
-    @location(0) position: vec3<f32>,  // world position of quad corner
-    @location(1) uv: vec2<f32>,        // texture UV into atlas
-    @location(2) alpha: f32,           // per-cloud opacity (negative = shadow)
-};
-
-struct CloudVertexOutput {
+struct CloudOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) alpha: f32,           // positive = cloud, negative = shadow
-    @location(2) world_z: f32,
 };
 
 @vertex
-fn vs_cloud(in: CloudVertexInput) -> CloudVertexOutput {
-    var out: CloudVertexOutput;
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
-    out.uv = in.uv;
-    out.alpha = in.alpha;
-    out.world_z = in.position.z;
+fn vs_cloud(@builtin(vertex_index) vi: u32) -> CloudOutput {
+    // Fullscreen triangle (oversized, clipped by rasterizer)
+    var out: CloudOutput;
+    let x = f32(i32(vi & 1u)) * 4.0 - 1.0;
+    let y = f32(i32(vi >> 1u)) * 4.0 - 1.0;
+    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>(x * 0.5 + 0.5, 1.0 - (y * 0.5 + 0.5));
     return out;
 }
 
+// Smooth Voronoi-like cell noise for puffy cloud shapes
+fn cloud_cell(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    var min_d = 1.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let neighbor = vec2<f32>(f32(x), f32(y));
+            let point = hash22(i + neighbor);
+            let diff = neighbor + point - f;
+            min_d = min(min_d, dot(diff, diff));
+        }
+    }
+    return 1.0 - sqrt(min_d);
+}
+
 @fragment
-fn fs_cloud(in: CloudVertexOutput) -> @location(0) vec4<f32> {
-    // Zoom-based visibility
-    let cloud_alpha_zoom = 1.0 - smoothstep(-1.5, -0.5, camera.zoom);
-    if cloud_alpha_zoom < 0.01 {
+fn fs_cloud(in: CloudOutput) -> @location(0) vec4<f32> {
+    // Skip if opacity is zero
+    if camera.cloud_opacity < 0.01 {
         discard;
     }
 
-    let tex_alpha = textureSample(cloud_texture, cloud_sampler, in.uv).a;
+    // Convert screen UV to world-space coordinates
+    let aspect = camera.viewport.x / camera.viewport.y;
+    let zoom_scale = 100.0 / pow(2.0, camera.zoom);
+    let world_x = camera.position.x + (in.uv.x - 0.5) * zoom_scale * aspect;
+    let world_y = camera.position.y + (0.5 - in.uv.y) * zoom_scale;
 
-    // Shadow quads have negative alpha
-    if in.alpha < 0.0 {
-        let shadow_a = tex_alpha * (-in.alpha) * cloud_alpha_zoom * 0.08;
-        if shadow_a < 0.003 { discard; }
-        return vec4<f32>(0.0, 0.0, 0.0, shadow_a);
+    // Drift leftward (negative X), slight upward
+    let drift = vec2<f32>(-camera.time * camera.cloud_speed * 0.15, camera.time * camera.cloud_speed * 0.02);
+    let cloud_uv = vec2<f32>(world_x, world_y) * 0.015 + drift;
+
+    // Layered cloud density using cell noise + value noise
+    let large = cloud_cell(cloud_uv * 1.0) * 0.6;
+    let medium = cloud_cell(cloud_uv * 2.3 + vec2<f32>(5.3, 1.7)) * 0.25;
+    let small = noise2(cloud_uv * 5.0 + vec2<f32>(3.1, 7.9)) * 0.15;
+    let density = large + medium + small;
+
+    // Threshold to create distinct cloud patches with soft edges
+    let cloud = smoothstep(0.45, 0.65, density);
+
+    if cloud < 0.005 {
+        discard;
     }
 
-    // Cloud quads — pure white
-    let final_alpha = tex_alpha * in.alpha * cloud_alpha_zoom * 0.65;
-    if final_alpha < 0.005 { discard; }
-    return vec4<f32>(1.0, 1.0, 1.0, final_alpha);
+    let alpha = cloud * 0.35 * camera.cloud_opacity;
+    return vec4<f32>(1.0, 1.0, 1.0, alpha);
 }

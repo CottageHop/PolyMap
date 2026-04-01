@@ -245,9 +245,13 @@ pub fn mvt_to_mapdata(
                 position: center,
                 angle: 0.0,
                 kind: LabelKind::Park,
+                path: None,
             });
         }
     }
+
+    // Sort buildings by height so taller buildings render on top
+    building_polys.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     // Layer 3.5: Building shadows
     {
@@ -330,22 +334,10 @@ pub fn mvt_to_mapdata(
     }
     } // end High-detail shadow block
 
-    // Layer 4: Buildings — sort by height so taller buildings render on top
-    // Budget: reserve ~40K verts for roads/labels that come after buildings
-    let building_budget: usize = 80_000;
-    building_polys.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    for (coords, name, height, boundary_mask) in &building_polys {
-        if vertices.len() > building_budget { break; } // stop adding buildings, save room for roads
+    // Layer 4: Buildings (sorted by height above)
+    for (coords, name, height, _boundary_mask) in &building_polys {
         let height_z = height / 11.1;
-        let is_skyscraper = *height >= 50.0;
-        let touches_boundary = boundary_mask.iter().any(|&b| b);
-
-        let (base_color, roof_mat, wall_mat) = if is_skyscraper {
-            (COLOR_SKYSCRAPER, MAT_GLASS, MAT_GLASS_WALL)
-        } else {
-            (COLOR_BUILDING, MAT_BUILDING, MAT_BUILDING_WALL)
-        };
+        let (base_color, roof_mat, wall_mat) = (COLOR_BUILDING, MAT_BUILDING, MAT_BUILDING_WALL);
 
         let c = polygon_centroid(coords);
         let color = [base_color[0], base_color[1], base_color[2], 1.0];
@@ -364,8 +356,8 @@ pub fn mvt_to_mapdata(
 
         let effective_height = height_z;
 
-        // Only extrude walls for buildings fully inside the tile
-        if !touches_boundary {
+        // Extrude walls
+        {
             let pts = if render_coords.len() > 1 && render_coords[0] == render_coords[render_coords.len() - 1] {
                 &render_coords[..render_coords.len() - 1]
             } else {
@@ -404,6 +396,7 @@ pub fn mvt_to_mapdata(
                 position: c,
                 angle: 0.0,
                 kind: LabelKind::Building,
+                path: None,
             });
         }
     }
@@ -483,8 +476,8 @@ pub fn mvt_to_mapdata(
         }
     }
 
-    // Road labels — place on straight sections of each road segment
-    let label_spacing = 20.0f32;
+    // Road labels — one label per named road per tile
+    let label_spacing = 200.0f32;
     // Maximum angle change (radians) between adjacent segments to be considered "straight"
     let max_curvature = 0.35; // ~20 degrees
     for (coords, road_type, name) in &road_lines {
@@ -541,6 +534,7 @@ pub fn mvt_to_mapdata(
                             position: pos,
                             angle,
                             kind: LabelKind::Street,
+                            path: Some(coords.clone()),
                         });
                     }
                     next_label_at += label_spacing;
@@ -643,7 +637,9 @@ fn process_buildings_layer(
             continue;
         }
 
-        let height = feature.get_f64(layer, "height").unwrap_or(10.0) as f32;
+        let height = feature.get_f64(layer, "render_height")
+            .or_else(|| feature.get_f64(layer, "height"))
+            .unwrap_or(10.0) as f32;
         let name = feature.get_str(layer, "name").map(|s| s.to_string());
 
         // MVT MultiPolygons have multiple rings — each outer ring is a separate building
@@ -849,6 +845,7 @@ fn process_places_layer(
                     position: pos,
                     angle: 0.0,
                     kind: label_kind,
+                    path: None,
                 });
             }
         }

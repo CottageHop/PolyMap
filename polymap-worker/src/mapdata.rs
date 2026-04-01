@@ -76,6 +76,8 @@ pub struct Label {
     pub position: [f32; 2],
     pub angle: f32, // rotation in radians (0 = horizontal, positive = counter-clockwise)
     pub kind: LabelKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<[f32; 2]>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -91,11 +93,21 @@ impl Label {
     /// Font scale factor based on label type.
     pub fn font_scale(&self) -> f32 {
         match self.kind {
-            LabelKind::City => 2.0,
-            LabelKind::Street => 0.7,
-            LabelKind::Park => 0.75,
-            LabelKind::Building => 0.45,
-            LabelKind::Listing => 0.85,
+            LabelKind::City => 2.5,
+            LabelKind::Street => 1.0,
+            LabelKind::Park => 1.0,
+            LabelKind::Building => 0.65,
+            LabelKind::Listing => 1.1,
+        }
+    }
+
+    pub fn letter_spacing(&self) -> f32 {
+        match self.kind {
+            LabelKind::City => 1.35,
+            LabelKind::Street => 1.35,
+            LabelKind::Park => 1.1,
+            LabelKind::Building => 1.0,
+            LabelKind::Listing => 1.0,
         }
     }
 }
@@ -174,6 +186,7 @@ impl MapData {
                     position: pos,
                     angle: 0.0,
                     kind: LabelKind::Listing,
+                    path: None,
                 });
             }
 
@@ -760,6 +773,7 @@ pub fn parse_osm_json_centered(
                 position: center,
                 angle: 0.0,
                 kind: LabelKind::Park,
+                path: None,
             });
         }
     }
@@ -931,6 +945,7 @@ pub fn parse_osm_json_centered(
                         position: pos,
                         angle,
                         kind: LabelKind::Street,
+                        path: None,
                     });
                     next_label_at += label_spacing;
                 }
@@ -949,6 +964,7 @@ pub fn parse_osm_json_centered(
                 position: center,
                 angle: 0.0,
                 kind: LabelKind::Building,
+                path: None,
             });
         }
     }

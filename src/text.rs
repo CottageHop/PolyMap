@@ -48,11 +48,14 @@ impl TextSystem {
     }
 }
 
-const ATLAS_SIZE: u32 = 512;
-const FONT_SIZE: f32 = 22.0;
+const ATLAS_SIZE: u32 = 1024;
+const FONT_SIZE: f32 = 32.0;
+/// Tighten letter spacing (1.0 = normal, <1.0 = tighter)
+/// Global baseline kerning (applied at atlas level)
+const KERNING: f32 = 0.82;
 
 impl TextSystem {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, config: &wgpu::SurfaceConfiguration, camera_bind_group_layout: &wgpu::BindGroupLayout) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, config: &wgpu::SurfaceConfiguration, camera_bind_group_layout: &wgpu::BindGroupLayout, msaa_samples: u32) -> Self {
         // Load a system font
         let font = load_system_font();
         let font_size = FONT_SIZE;
@@ -203,7 +206,7 @@ impl TextSystem {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: crate::gpu::MSAA_SAMPLES,
+                count: msaa_samples,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -245,11 +248,43 @@ impl TextSystem {
     }
 
     pub fn upload_labels_at_zoom(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label], zoom: f32) {
+        self.upload_labels_themed(device, queue, labels, zoom, [0.0; 4], [0.0; 4]);
+    }
+
+    pub fn upload_labels_themed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        labels: &[Label],
+        zoom: f32,
+        road_tint: [f32; 4],
+        land_tint: [f32; 4],
+    ) {
         let mut vertices: Vec<TextVertex> = Vec::with_capacity(256 * 20);
         let mut indices: Vec<u32> = Vec::with_capacity(256 * 30);
 
-        let text_color = [0.2, 0.2, 0.2, 1.0];
-        let halo_color = [1.0, 1.0, 1.0, 0.85];
+        // Adapt label colors to the theme.
+        // If road tint is active, compute luminance — dark roads get light text, light roads get dark text.
+        let road_active = road_tint[3] > 0.5;
+        let road_lum = road_tint[0] * 0.299 + road_tint[1] * 0.587 + road_tint[2] * 0.114;
+        let land_active = land_tint[3] > 0.5;
+        let land_lum = land_tint[0] * 0.299 + land_tint[1] * 0.587 + land_tint[2] * 0.114;
+
+        let (text_color, halo_color) = if land_active && land_lum < 0.3 {
+            ([1.0_f32, 1.0, 1.0, 1.0], [0.0_f32, 0.0, 0.0, 0.9])
+        } else {
+            ([0.0_f32, 0.0, 0.0, 1.0], [1.0_f32, 1.0, 1.0, 0.9])
+        };
+
+        let (street_text, street_halo) = if road_active {
+            if road_lum < 0.3 {
+                ([1.0_f32, 1.0, 1.0, 1.0], [0.0_f32, 0.0, 0.0, 0.8])
+            } else {
+                ([0.0_f32, 0.0, 0.0, 1.0], [1.0_f32, 1.0, 1.0, 0.8])
+            }
+        } else {
+            ([0.0_f32, 0.0, 0.0, 0.9], [1.0_f32, 1.0, 1.0, 0.8])
+        };
 
         // Spatial grids for O(1) collision detection — separate grids so
         // streets don't compete with city/park labels for placement
@@ -313,29 +348,48 @@ impl TextSystem {
 
             let (label_text_color, label_halo_color) = match label.kind {
                 crate::mapdata::LabelKind::Listing => {
-                    ([0.0_f32, 0.0, 0.0, 1.0], [1.0_f32, 1.0, 1.0, 0.9])
+                    if land_active && land_lum < 0.3 {
+                        ([1.0_f32, 1.0, 1.0, 1.0], [0.0_f32, 0.0, 0.0, 0.9])
+                    } else {
+                        ([0.0_f32, 0.0, 0.0, 1.0], [1.0_f32, 1.0, 1.0, 0.9])
+                    }
                 }
                 crate::mapdata::LabelKind::Street => {
-                    ([0.35_f32, 0.35, 0.35, 0.85], [1.0_f32, 1.0, 1.0, 0.7])
+                    (text_color, halo_color)
                 }
                 _ => (text_color, halo_color),
             };
+            // Measure total width for centering (with per-label letter spacing)
+            let spacing = label.letter_spacing();
+            let total_width: f32 = label.text.chars()
+                .filter_map(|c| self.get_glyph(c))
+                .map(|g| g.advance * scale * spacing)
+                .sum();
+
+            // Curved road labels: place each glyph at its own world position along the path
+            if let Some(ref path) = label.path {
+                if path.len() >= 2 {
+                    self.emit_curved_label(
+                        path, &label.text, &label.position, scale, spacing, total_width, zoom,
+                        label_text_color, label_halo_color,
+                        &mut vertices, &mut indices,
+                    );
+                    continue;
+                }
+            }
+
+            // Straight labels (non-road or fallback)
             let cos_a = label.angle.cos();
             let sin_a = label.angle.sin();
-
-            // Rotate a pixel offset by the label angle
             let rotate = |x: f32, y: f32| -> (f32, f32) {
                 (x * cos_a - y * sin_a, x * sin_a + y * cos_a)
             };
 
-            // Measure total width for centering
-            let total_width: f32 = label.text.chars()
-                .filter_map(|c| self.get_glyph(c))
-                .map(|g| g.advance * scale)
-                .sum();
-
-            // Render halo (white outline) — 4 offset copies
-            for &(ox, oy) in &[(-1.0_f32, 0.0_f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+            // Render halo (outline) — 8 offset copies for bolder appearance
+            for &(ox, oy) in &[
+                (-1.5_f32, 0.0_f32), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5),
+                (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+            ] {
                 let mut cursor_x = -total_width * 0.5 + ox;
                 let cursor_y = -self.font_size * scale * 0.5 + oy;
 
@@ -352,7 +406,7 @@ impl TextSystem {
                             &mut vertices,
                             &mut indices,
                         );
-                        cursor_x += glyph.advance * scale;
+                        cursor_x += glyph.advance * scale * spacing;
                     }
                 }
             }
@@ -374,7 +428,7 @@ impl TextSystem {
                         &mut vertices,
                         &mut indices,
                     );
-                    cursor_x += glyph.advance * scale;
+                    cursor_x += glyph.advance * scale * spacing;
                 }
             }
         }
@@ -429,6 +483,131 @@ impl TextSystem {
         vertices.push(TextVertex { world_pos, pixel_offset: [r3x, r3y], uv: [glyph.uv_max[0], glyph.uv_max[1]], color });
 
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    /// Place glyphs along a world-space polyline path, curving with the road.
+    fn emit_curved_label(
+        &self,
+        path: &[[f32; 2]],
+        text: &str,
+        anchor: &[f32; 2],
+        scale: f32,
+        spacing: f32,
+        total_width_px: f32,
+        zoom: f32,
+        text_color: [f32; 4],
+        halo_color: [f32; 4],
+        vertices: &mut Vec<TextVertex>,
+        indices: &mut Vec<u32>,
+    ) {
+        // Compute cumulative arc-length along path
+        let mut cum_len = vec![0.0f32; path.len()];
+        for i in 1..path.len() {
+            let dx = path[i][0] - path[i - 1][0];
+            let dy = path[i][1] - path[i - 1][1];
+            cum_len[i] = cum_len[i - 1] + (dx * dx + dy * dy).sqrt();
+        }
+        let path_len = *cum_len.last().unwrap_or(&0.0);
+        if path_len < 1e-6 { return; }
+
+        // Find the arc-length distance of the anchor point on the path
+        let mut anchor_dist = 0.0f32;
+        let mut best_sq = f32::MAX;
+        for i in 0..path.len().saturating_sub(1) {
+            let ax = path[i][0]; let ay = path[i][1];
+            let bx = path[i + 1][0]; let by = path[i + 1][1];
+            let dx = bx - ax; let dy = by - ay;
+            let seg_sq = dx * dx + dy * dy;
+            if seg_sq < 1e-12 { continue; }
+            let t = ((anchor[0] - ax) * dx + (anchor[1] - ay) * dy) / seg_sq;
+            let t = t.clamp(0.0, 1.0);
+            let px = ax + dx * t;
+            let py = ay + dy * t;
+            let dist_sq = (anchor[0] - px) * (anchor[0] - px) + (anchor[1] - py) * (anchor[1] - py);
+            if dist_sq < best_sq {
+                best_sq = dist_sq;
+                anchor_dist = cum_len[i] + t * (cum_len[i + 1] - cum_len[i]);
+            }
+        }
+
+        let glyphs: Vec<(char, f32)> = text.chars()
+            .filter_map(|c| self.get_glyph(c).map(|g| (c, g.advance * scale * spacing)))
+            .collect();
+        if glyphs.is_empty() { return; }
+
+        // Convert pixel advance to world units, matching the text shader's zoom scaling.
+        // Derived from: shader zoom_scale = 2^(z*0.5) * (1000/ref_size),
+        // ortho projection scale = 100 / 2^z, ref_size = 1000.
+        // Result: world_per_pixel = 0.2 / 2^(zoom * 0.5)
+        let world_per_px = 0.05 / 2.0_f32.powf(zoom * 0.5);
+
+        // Starting distance along the path (center the text on the anchor)
+        let start_dist = anchor_dist - total_width_px * world_per_px * 0.5;
+        let end_dist = start_dist + total_width_px * world_per_px;
+
+        // Skip label entirely if it doesn't fit within the path
+        if start_dist < 0.0 || end_dist > path_len { return; }
+
+        // Decide text direction ONCE for the whole label.
+        // Sample the overall tangent at the label center — if it points leftward,
+        // flip the whole label so text reads left-to-right with the font baseline
+        // toward the bottom of the screen.
+        let (mid_tx, mid_ty) = sample_tangent(path, &cum_len, anchor_dist);
+        let mid_angle = (-mid_ty).atan2(mid_tx);
+        let flip = mid_angle.abs() > std::f32::consts::FRAC_PI_2;
+
+        // Emit each glyph along the path — skip glyphs that fall outside the path
+        let emit_glyphs = |color: [f32; 4], ox: f32, oy: f32, verts: &mut Vec<TextVertex>, idxs: &mut Vec<u32>| {
+            let mut cursor_px = 0.0f32;
+            for &(ch, advance_px) in &glyphs {
+                let glyph = match self.get_glyph(ch) {
+                    Some(g) => g,
+                    None => { cursor_px += advance_px; continue; }
+                };
+
+                // Center of this glyph in world-distance
+                let char_center_px = cursor_px + advance_px * 0.5;
+                let d = if flip {
+                    start_dist + (total_width_px - char_center_px) * world_per_px
+                } else {
+                    start_dist + char_center_px * world_per_px
+                };
+
+                // Skip glyphs that fall outside the path bounds
+                if d < 0.0 || d > path_len {
+                    cursor_px += advance_px;
+                    continue;
+                }
+
+                let (wx, wy) = sample_path(path, &cum_len, d);
+                let (tx, ty) = sample_tangent(path, &cum_len, d);
+
+                // Per-character angle from tangent, with consistent flip for all chars
+                let mut angle = (-ty).atan2(tx);
+                if flip { angle += std::f32::consts::PI; }
+
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let rotate = |x: f32, y: f32| -> (f32, f32) {
+                    (x * cos_a - y * sin_a, x * sin_a + y * cos_a)
+                };
+
+                let px = -advance_px * 0.5 + glyph.bearing[0] * scale + ox;
+                let py = -self.font_size * scale * 0.5 + glyph.bearing[1] * scale + oy;
+                self.emit_glyph_quad_rotated(
+                    [wx, wy], px, py, glyph, scale, color, &rotate,
+                    verts, idxs,
+                );
+                cursor_px += advance_px;
+            }
+        };
+
+        // Halo
+        for &(ox, oy) in &[(-1.0_f32, 0.0_f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+            emit_glyphs(halo_color, ox, oy, vertices, indices);
+        }
+        // Text
+        emit_glyphs(text_color, 0.0, 0.0, vertices, indices);
     }
 
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, camera_bind_group: &'a wgpu::BindGroup) {
@@ -544,7 +723,7 @@ fn build_glyph_atlas(font: &fontdue::Font, font_size: f32) -> (Vec<u8>, HashMap<
             uv_max,
             size: [w as f32, h as f32],
             bearing: [metrics.xmin as f32, -(metrics.ymin as f32 + h as f32 - font_size)],
-            advance: metrics.advance_width,
+            advance: metrics.advance_width * KERNING,
         });
 
         cursor_x += w + 1;
@@ -553,4 +732,49 @@ fn build_glyph_atlas(font: &fontdue::Font, font_size: f32) -> (Vec<u8>, HashMap<
 
 
     (atlas, glyphs)
+}
+
+/// Sample a point on a polyline at the given arc-length distance.
+/// Clamps to path endpoints if distance is out of range.
+fn sample_path(path: &[[f32; 2]], cum_len: &[f32], dist: f32) -> (f32, f32) {
+    if path.is_empty() { return (0.0, 0.0); }
+    if dist <= 0.0 { return (path[0][0], path[0][1]); }
+    let total = *cum_len.last().unwrap_or(&0.0);
+    if dist >= total {
+        let p = path.last().unwrap();
+        return (p[0], p[1]);
+    }
+    for i in 1..path.len() {
+        if cum_len[i] >= dist {
+            let seg_len = cum_len[i] - cum_len[i - 1];
+            if seg_len < 1e-8 { continue; }
+            let t = (dist - cum_len[i - 1]) / seg_len;
+            let x = path[i - 1][0] + (path[i][0] - path[i - 1][0]) * t;
+            let y = path[i - 1][1] + (path[i][1] - path[i - 1][1]) * t;
+            return (x, y);
+        }
+    }
+    let p = path.last().unwrap();
+    (p[0], p[1])
+}
+
+/// Sample the unit tangent direction at a given arc-length distance.
+fn sample_tangent(path: &[[f32; 2]], cum_len: &[f32], dist: f32) -> (f32, f32) {
+    if path.len() < 2 { return (1.0, 0.0); }
+    let total = *cum_len.last().unwrap_or(&0.0);
+    let d = dist.clamp(0.0, total);
+    for i in 1..path.len() {
+        if cum_len[i] >= d {
+            let dx = path[i][0] - path[i - 1][0];
+            let dy = path[i][1] - path[i - 1][1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-8 { continue; }
+            return (dx / len, dy / len);
+        }
+    }
+    let dx = path[path.len() - 1][0] - path[path.len() - 2][0];
+    let dy = path[path.len() - 1][1] - path[path.len() - 2][1];
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-8 { return (1.0, 0.0); }
+    (dx / len, dy / len)
 }
