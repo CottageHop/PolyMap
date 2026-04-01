@@ -1,7 +1,7 @@
 {
   "name": "polymap",
   "version": "0.1.0",
-  "description": "3D map renderer with WebGPU - JS library and Vue component",
+  "description": "3D map renderer with WebGPU - JS library",
   "type": "module",
   "main": "src/index.js",
   "module": "src/index.js",
@@ -11,28 +11,16 @@
     },
     "./polymap": {
       "import": "./src/polymap.js"
-    },
-    "./vue": {
-      "import": "./src/PolyMap.vue"
     }
   },
   "files": [
     "src/"
   ],
-  "peerDependencies": {
-    "vue": "^3.0.0"
-  },
-  "peerDependenciesMeta": {
-    "vue": {
-      "optional": true
-    }
-  },
   "keywords": [
     "map",
     "3d",
     "webgpu",
     "wasm",
-    "vue",
     "openstreetmap"
   ],
   "license": "MIT",

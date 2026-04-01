@@ -40,7 +40,17 @@ pub struct CameraUniform {
     pub time: f32,
     /// Tilt angle in radians
     pub tilt: f32,
-    pub _padding: f32,
+    /// Cloud opacity (0.0 = invisible, 1.0 = full)
+    pub cloud_opacity: f32,
+    /// Cloud animation speed multiplier (0 = frozen, 1 = default)
+    pub cloud_speed: f32,
+    pub _pad2: [f32; 3],
+    /// Color tints — when alpha > 0.5, replaces the base vertex color for that material
+    pub water_tint: [f32; 4],
+    pub park_tint: [f32; 4],
+    pub building_tint: [f32; 4],
+    pub road_tint: [f32; 4],
+    pub land_tint: [f32; 4],
 }
 
 impl Default for CameraUniform {
@@ -52,7 +62,14 @@ impl Default for CameraUniform {
             zoom: 0.8,
             time: 0.0,
             tilt: 1.5,
-            _padding: 0.0,
+            cloud_opacity: 1.0,
+            cloud_speed: 1.0,
+            _pad2: [0.0; 3],
+            water_tint: [0.0; 4],
+            park_tint: [0.0; 4],
+            building_tint: [0.0; 4],
+            road_tint: [0.0; 4],
+            land_tint: [0.0; 4],
         }
     }
 }
@@ -199,7 +216,14 @@ impl Camera {
             zoom: self.zoom,
             time,
             tilt: self.tilt,
-            _padding: 0.0,
+            cloud_opacity: 1.0,
+            cloud_speed: 1.0,
+            _pad2: [0.0; 3],
+            water_tint: [0.0; 4],
+            park_tint: [0.0; 4],
+            building_tint: [0.0; 4],
+            road_tint: [0.0; 4],
+            land_tint: [0.0; 4],
         }
     }
 

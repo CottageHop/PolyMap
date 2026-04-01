@@ -10,7 +10,16 @@ struct CameraUniform {
     zoom: f32,
     time: f32,
     tilt: f32,
-    _padding: f32,
+    cloud_opacity: f32,
+    cloud_speed: f32,
+    _pad2a: f32,
+    _pad2b: f32,
+    _pad2c: f32,
+    water_tint: vec4<f32>,
+    park_tint: vec4<f32>,
+    building_tint: vec4<f32>,
+    road_tint: vec4<f32>,
+    land_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -78,6 +87,7 @@ impl TextureSystem {
         queue: &wgpu::Queue,
         config: &wgpu::SurfaceConfiguration,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
+        msaa_samples: u32,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Background Shader"),
@@ -149,7 +159,7 @@ impl TextureSystem {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: crate::gpu::MSAA_SAMPLES,
+                count: msaa_samples,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },

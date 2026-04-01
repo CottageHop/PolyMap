@@ -60,6 +60,13 @@ pub struct App {
     cursor_pos: Vec2,
     markers: Vec<Marker>,
     layer_visibility: LayerVisibility,
+    cloud_opacity: f32,
+    cloud_speed: f32,
+    water_tint: [f32; 4],
+    park_tint: [f32; 4],
+    building_tint: [f32; 4],
+    road_tint: [f32; 4],
+    land_tint: [f32; 4],
     ready_emitted: bool,
     markers_dirty: bool,
     labels_dirty: bool,
@@ -106,6 +113,13 @@ impl App {
             cursor_pos: Vec2::ZERO,
             markers: Vec::new(),
             layer_visibility: layer_vis,
+            cloud_opacity: 0.5,
+            cloud_speed: 1.0,
+            water_tint: [0.0; 4],
+            park_tint: [0.0; 4],
+            building_tint: [0.0; 4],
+            road_tint: [0.0; 4],
+            land_tint: [0.0; 4],
             ready_emitted: false,
             markers_dirty: false,
             labels_dirty: false,
@@ -218,11 +232,23 @@ impl App {
                             "trees" => self.layer_visibility.trees = visible,
                             "shadows" => self.layer_visibility.shadows = visible,
                             "labels" => self.layer_visibility.labels = visible,
+                            "clouds" => self.layer_visibility.clouds = visible,
                             _ => log::warn!("Unknown layer: {}", layer),
                         }
                     }
-                    api::Command::SetColors(_colors) => {
-                        // TODO: re-tessellate with new colors
+                    api::Command::SetCloudOpacity(opacity) => {
+                        self.cloud_opacity = opacity.clamp(0.0, 1.0);
+                    }
+                    api::Command::SetCloudSpeed(speed) => {
+                        self.cloud_speed = speed.clamp(0.0, 5.0);
+                    }
+                    api::Command::SetColors(colors) => {
+                        if let Some(c) = colors.water { self.water_tint = c; }
+                        if let Some(c) = colors.park { self.park_tint = c; }
+                        if let Some(c) = colors.building { self.building_tint = c; }
+                        if let Some(c) = colors.road { self.road_tint = c; }
+                        if let Some(c) = colors.land { self.land_tint = c; }
+                        self.labels_dirty = true; // rebuild labels with new theme colors
                     }
                     api::Command::UploadBackgroundTexture { width, height, rgba_data } => {
                         if let (Some(gpu), Some(renderer)) = (&self.gpu, &mut self.renderer) {
@@ -254,16 +280,8 @@ impl App {
                             );
                         }
                     }
-                    api::Command::UploadCloudTexture { width, height, rgba_data } => {
-                        if let (Some(gpu), Some(renderer)) = (&self.gpu, &mut self.renderer) {
-                            renderer.clouds.upload_texture(
-                                &gpu.device,
-                                &gpu.queue,
-                                width,
-                                height,
-                                &rgba_data,
-                            );
-                        }
+                    api::Command::UploadCloudTexture { .. } => {
+                        // Clouds are now procedural — texture upload is a no-op
                     }
                     api::Command::LoadBbox { south, west, north, east } => {
                         let s = south; let w = west; let n = north; let e = east;
@@ -506,8 +524,28 @@ impl ApplicationHandler for App {
 
         #[cfg(target_arch = "wasm32")]
         {
+            use wasm_bindgen::JsCast;
             self.window = Some(window.clone());
-            self.gpu_pending = Some(Box::pin(GpuState::new(window)));
+
+            // Create surface from canvas OUTSIDE winit's event handler to avoid
+            // Safari RefCell re-entrancy panic. We look up the canvas directly
+            // and pass it to GpuState::new_from_canvas instead of going through
+            // winit's window surface creation.
+            let canvas_selector = api::INIT_CONFIG.with(|c| {
+                c.borrow().as_ref().and_then(|cfg| cfg.canvas.clone())
+            }).unwrap_or_else(|| "#polymap-canvas".to_string());
+
+            let canvas = web_sys::window()
+                .and_then(|win| win.document())
+                .and_then(|doc| doc.query_selector(&canvas_selector).ok().flatten())
+                .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+
+            if let Some(canvas) = canvas {
+                self.gpu_pending = Some(Box::pin(GpuState::new_from_canvas(canvas)));
+            } else {
+                // Fallback: use winit's window (may fail on Safari)
+                self.gpu_pending = Some(Box::pin(GpuState::new(window)));
+            }
         }
     }
 
@@ -721,7 +759,7 @@ impl ApplicationHandler for App {
                         if should_rebuild {
                             let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.text.upload_labels_at_zoom(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom);
+                                renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint);
                             }
                             self.last_label_zoom = self.camera.zoom;
                             self.labels_dirty = false;
@@ -743,17 +781,6 @@ impl ApplicationHandler for App {
                         api::emit_event("camera:move", &wasm_bindgen::JsValue::UNDEFINED);
                     }
                     self.frames_since_camera_moved = self.frames_since_camera_moved.saturating_add(1);
-                }
-
-                // Regenerate cloud billboard geometry when camera moves significantly
-                // (done in a separate block to avoid borrow conflicts)
-                if let (Some(gpu), Some(renderer)) = (&self.gpu, &mut self.renderer) {
-                    renderer.clouds.maybe_regenerate(
-                        &gpu.device,
-                        &gpu.queue,
-                        self.camera.position.x,
-                        self.camera.position.y,
-                    );
                 }
 
                 if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
@@ -783,7 +810,7 @@ impl ApplicationHandler for App {
                     // Emit marker positions only when camera moved or markers changed
                     #[cfg(target_arch = "wasm32")]
                     {
-                        if (camera_moved || self.markers_dirty) && (!self.markers.is_empty() || self.markers_dirty) {
+                        if !self.markers.is_empty() || self.markers_dirty {
                             self.emit_marker_positions();
                             self.markers_dirty = false;
                         }
@@ -793,32 +820,51 @@ impl ApplicationHandler for App {
                     let has_markers = !self.markers.is_empty();
                     let has_loading_tiles = self.use_tiles && self.tile_manager.as_ref()
                         .map_or(false, |tm| tm.tiles.values().any(|s| matches!(s, crate::tiles::TileState::Loading)));
+                    let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
                     let needs_render = camera_moved
                         || self.frames_since_camera_moved < 3
                         || (self.use_tiles && self.tile_manager.as_ref().map_or(false, |tm| tm.tiles_changed))
                         || self.labels_dirty
                         || has_markers
-                        || has_loading_tiles  // keep rendering while tiles are still loading
+                        || has_loading_tiles
                         || !self.ready_emitted
                         || !self.first_render_done
-                        || self.frames_since_gpu_init < 300; // keep alive for ~5s after init
+                        || self.frames_since_gpu_init < 300
+                        || clouds_animating;
 
                     if !needs_render {
                         return;
                     }
                     self.first_render_done = true;
 
-                    let uniform = self.camera.uniform(elapsed);
+                    let mut uniform = self.camera.uniform(elapsed);
+                    uniform.cloud_opacity = self.cloud_opacity;
+                    uniform.cloud_speed = self.cloud_speed;
+                    uniform.water_tint = self.water_tint;
+                    uniform.park_tint = self.park_tint;
+                    uniform.building_tint = self.building_tint;
+                    uniform.road_tint = self.road_tint;
+                    uniform.land_tint = self.land_tint;
                     gpu.queue.write_buffer(&gpu.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
+
+                    // Clear color must be in linear space for sRGB surfaces.
+                    // land_tint values from JS are already linear (sRGB-to-linear in hexToRgba).
+                    // Default cream [0.95, 0.90, 0.85] is sRGB — convert to linear.
+                    let clear = if self.land_tint[3] > 0.5 {
+                        [self.land_tint[0] as f64, self.land_tint[1] as f64, self.land_tint[2] as f64]
+                    } else {
+                        // sRGB cream → linear
+                        [0.880, 0.787, 0.694]
+                    };
 
                     let render_result = if self.use_tiles {
                         if let Some(tm) = &self.tile_manager {
-                            renderer.render_tiles(gpu, tm.loaded_tiles())
+                            renderer.render_tiles(gpu, tm.loaded_tiles(), &self.layer_visibility, clear)
                         } else {
-                            renderer.render(gpu)
+                            renderer.render(gpu, &self.layer_visibility, clear)
                         }
                     } else {
-                        renderer.render(gpu)
+                        renderer.render(gpu, &self.layer_visibility, clear)
                     };
 
                     match render_result {
@@ -875,12 +921,382 @@ pub fn run_app(map_data: Option<MapData>) {
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-/// Internal async init called from PolyMap constructor.
-/// Uses tile-based loading — no upfront bulk fetch.
+/// One frame of the main loop. Extracted so it can be called from either
+/// winit's event loop (native) or a raw requestAnimationFrame loop (WASM).
+#[cfg(target_arch = "wasm32")]
+impl App {
+    fn tick(&mut self) {
+        self.drain_commands();
+
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+        let elapsed = (now - self.start_time).as_secs_f32();
+
+        let camera_moved = self.camera.update(dt);
+
+        // WASM DPR fix: sync canvas physical pixels with GPU surface.
+        {
+            use wasm_bindgen::JsCast;
+            self.frames_since_gpu_init += 1;
+            if self.frames_since_gpu_init % 30 == 0 {
+                if let Some(canvas) = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.query_selector("canvas").ok().flatten())
+                    .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+                {
+                    let dpr = web_sys::window()
+                        .map(|w| w.device_pixel_ratio()).unwrap_or(1.0);
+                    let physical_w = (canvas.client_width() as f64 * dpr).round() as u32;
+                    let physical_h = (canvas.client_height() as f64 * dpr).round() as u32;
+
+                    if physical_w > 0 && physical_h > 0 {
+                        if canvas.width() != physical_w || canvas.height() != physical_h {
+                            canvas.set_width(physical_w);
+                            canvas.set_height(physical_h);
+                        }
+                        if let Some(gpu) = &mut self.gpu {
+                            if physical_w != gpu.size.width || physical_h != gpu.size.height {
+                                gpu.resize(winit::dpi::PhysicalSize::new(physical_w, physical_h));
+                                self.camera.resize(physical_w as f32, physical_h as f32);
+                                self.labels_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tile-based loading
+        if self.use_tiles {
+            if self.tile_manager.is_none() {
+                let (clat, clon) = self.get_start_center();
+                self.tile_manager = Some(tiles::TileManager::new(clat, clon));
+            }
+            if let (Some(gpu), Some(tm)) = (&self.gpu, &mut self.tile_manager) {
+                tm.poll_completed(gpu);
+                let frame = tm.frame_counter;
+                tm.frame_counter += 1;
+                if frame % 10 == 0 || frame < 3 {
+                    tm.update_detail(tiles::detail_for_zoom(self.camera.zoom));
+                    let visible = tm.visible_tiles(&self.camera);
+                    tm.request_visible_tiles(&visible);
+                    tm.update_visibility(&visible);
+                }
+                let zoom_changed = (self.camera.zoom - self.last_label_zoom).abs() > 0.1;
+                let camera_settled = self.frames_since_camera_moved > 10;
+                let should_rebuild = tm.tiles_changed
+                    || zoom_changed
+                    || (self.labels_dirty && camera_settled);
+                if should_rebuild {
+                    let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint);
+                    }
+                    self.last_label_zoom = self.camera.zoom;
+                    self.labels_dirty = false;
+                }
+            }
+        }
+
+        // Track camera settle
+        if camera_moved {
+            if self.frames_since_camera_moved > 5 {
+                self.labels_dirty = true;
+            }
+            self.frames_since_camera_moved = 0;
+        } else {
+            if self.frames_since_camera_moved == 5 && self.ready_emitted {
+                api::emit_event("camera:move", &wasm_bindgen::JsValue::UNDEFINED);
+            }
+            self.frames_since_camera_moved = self.frames_since_camera_moved.saturating_add(1);
+        }
+
+        if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
+            self.update_camera_state();
+
+            if !self.ready_emitted {
+                self.ready_emitted = true;
+                let ready_data = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(&ready_data, &"width".into(),
+                    &wasm_bindgen::JsValue::from_f64(gpu.size.width as f64));
+                let _ = js_sys::Reflect::set(&ready_data, &"height".into(),
+                    &wasm_bindgen::JsValue::from_f64(gpu.size.height as f64));
+                let dpr = web_sys::window()
+                    .map(|w| w.device_pixel_ratio()).unwrap_or(1.0);
+                let _ = js_sys::Reflect::set(&ready_data, &"dpr".into(),
+                    &wasm_bindgen::JsValue::from_f64(dpr));
+                api::emit_event("ready", &ready_data.into());
+            }
+
+            if !self.markers.is_empty() || self.markers_dirty {
+                self.emit_marker_positions();
+                self.markers_dirty = false;
+            }
+
+            let has_markers = !self.markers.is_empty();
+            let has_loading_tiles = self.use_tiles && self.tile_manager.as_ref()
+                .map_or(false, |tm| tm.tiles.values().any(|s| matches!(s, crate::tiles::TileState::Loading)));
+            let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
+            let needs_render = camera_moved
+                || self.frames_since_camera_moved < 3
+                || (self.use_tiles && self.tile_manager.as_ref().map_or(false, |tm| tm.tiles_changed))
+                || self.labels_dirty
+                || has_markers
+                || has_loading_tiles
+                || !self.ready_emitted
+                || !self.first_render_done
+                || self.frames_since_gpu_init < 300
+                || clouds_animating;
+
+            if !needs_render { return; }
+            self.first_render_done = true;
+
+            let mut uniform = self.camera.uniform(elapsed);
+            uniform.cloud_opacity = self.cloud_opacity;
+            uniform.cloud_speed = self.cloud_speed;
+            uniform.water_tint = self.water_tint;
+            uniform.park_tint = self.park_tint;
+            uniform.building_tint = self.building_tint;
+            uniform.road_tint = self.road_tint;
+            uniform.land_tint = self.land_tint;
+            gpu.queue.write_buffer(&gpu.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
+
+            let clear = if self.land_tint[3] > 0.5 {
+                [self.land_tint[0] as f64, self.land_tint[1] as f64, self.land_tint[2] as f64]
+            } else {
+                [0.880, 0.787, 0.694]
+            };
+
+            let render_result = if self.use_tiles {
+                if let Some(tm) = &self.tile_manager {
+                    renderer.render_tiles(gpu, tm.loaded_tiles(), &self.layer_visibility, clear)
+                } else {
+                    renderer.render(gpu, &self.layer_visibility, clear)
+                }
+            } else {
+                renderer.render(gpu, &self.layer_visibility, clear)
+            };
+
+            match render_result {
+                Ok(_) => {}
+                Err(wgpu::SurfaceError::Lost) => {
+                    let size = gpu.size;
+                    if let Some(gpu) = &mut self.gpu {
+                        gpu.resize(size);
+                    }
+                }
+                Err(e) => log::warn!("Surface error: {:?}", e),
+            }
+        }
+    }
+}
+
+/// WASM bootstrap: bypasses winit entirely to avoid Safari RefCell panics.
+/// Uses requestAnimationFrame + raw DOM event listeners.
 #[cfg(target_arch = "wasm32")]
 pub async fn wasm_init() {
-    // Start with no data — tile manager handles loading dynamically
-    run_app(None);
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen::JsCast;
+
+    // Look up canvas
+    let canvas_selector = api::INIT_CONFIG.with(|c| {
+        c.borrow().as_ref().and_then(|cfg| cfg.canvas.clone())
+    }).unwrap_or_else(|| "#polymap-canvas".to_string());
+
+    let canvas: web_sys::HtmlCanvasElement = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(&canvas_selector).ok().flatten())
+        .and_then(|e| e.dyn_into().ok())
+        .expect("PolyMap: canvas not found");
+
+    // Create GPU surface directly from canvas (no winit)
+    let gpu = GpuState::new_from_canvas(canvas.clone()).await;
+    let renderer = Renderer::new(&gpu);
+
+    let mut app = App::new(None);
+    app.camera.resize(gpu.size.width as f32, gpu.size.height as f32);
+
+    // Apply config
+    let (zoom, tilt) = api::INIT_CONFIG.with(|c| {
+        let c = c.borrow();
+        let z = c.as_ref().and_then(|cfg| cfg.zoom).unwrap_or(DEFAULT_ZOOM);
+        let t = c.as_ref().and_then(|cfg| cfg.tilt);
+        (z, t)
+    });
+    app.camera.set_zoom(zoom);
+    if let Some(t) = tilt {
+        app.camera.tilt = t;
+        app.camera.set_target_tilt(t);
+    }
+
+    app.gpu = Some(gpu);
+    app.renderer = Some(renderer);
+
+    let app = Rc::new(RefCell::new(app));
+
+    // ── DOM event listeners ──────────────────────────────────────────
+    // All handlers use try_borrow_mut — if the app is borrowed (e.g. during
+    // tick()), the event is silently dropped. This prevents RefCell panics
+    // when the browser dispatches DOM events synchronously during rendering.
+    {
+        let app = app.clone();
+        let cb = Closure::<dyn FnMut(_)>::new(move |_: web_sys::MouseEvent| {
+            if let Ok(mut a) = app.try_borrow_mut() { a.mouse_pressed = true; }
+        });
+        canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref()).ok();
+        cb.forget();
+    }
+    // Register mouseup on document so releasing over a marker still ends the pan
+    {
+        let app = app.clone();
+        let cb = Closure::<dyn FnMut(_)>::new(move |_: web_sys::MouseEvent| {
+            if let Ok(mut a) = app.try_borrow_mut() {
+                a.mouse_pressed = false;
+                a.last_mouse_pos = None;
+            }
+        });
+        let doc = web_sys::window().unwrap().document().unwrap();
+        doc.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref()).ok();
+        cb.forget();
+    }
+    // Register mousemove on document so panning continues even when cursor is over markers
+    {
+        let app = app.clone();
+        let canvas_ref = canvas.clone();
+        let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0) as f32;
+        let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            if let Ok(mut a) = app.try_borrow_mut() {
+                let rect = canvas_ref.get_bounding_client_rect();
+                let x = (e.client_x() as f64 - rect.left()) as f32 * dpr;
+                let y = (e.client_y() as f64 - rect.top()) as f32 * dpr;
+                let current = Vec2::new(x, y);
+                a.cursor_pos = current;
+                if a.mouse_pressed {
+                    if let Some(last) = a.last_mouse_pos {
+                        let delta = current - last;
+                        a.camera.pan_by(delta);
+                    }
+                }
+                a.last_mouse_pos = Some(current);
+            }
+        });
+        let doc = web_sys::window().unwrap().document().unwrap();
+        doc.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref()).ok();
+        cb.forget();
+    }
+    {
+        let app = app.clone();
+        let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0) as f32;
+        let canvas_ref = canvas.clone();
+        let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::WheelEvent| {
+            e.prevent_default();
+            if let Ok(mut a) = app.try_borrow_mut() {
+                let scroll = -e.delta_y() as f32 * 0.01;
+                // Use clientX/Y minus canvas rect (works for both native and synthetic events)
+                let rect = canvas_ref.get_bounding_client_rect();
+                let x = (e.client_x() as f64 - rect.left()) as f32 * dpr;
+                let y = (e.client_y() as f64 - rect.top()) as f32 * dpr;
+                a.camera.zoom_at(scroll, Vec2::new(x, y));
+            }
+        });
+        let opts = web_sys::AddEventListenerOptions::new();
+        opts.set_passive(false);
+        canvas.add_event_listener_with_callback_and_add_event_listener_options(
+            "wheel", cb.as_ref().unchecked_ref(), &opts,
+        ).ok();
+        cb.forget();
+    }
+    // Touch support for mobile Safari
+    {
+        let app = app.clone();
+        let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0) as f32;
+        let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
+            e.prevent_default();
+            if let Ok(mut a) = app.try_borrow_mut() {
+                if let Some(touch) = e.touches().get(0) {
+                    let rect = e.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                        .map(|el| el.get_bounding_client_rect());
+                    if let Some(rect) = rect {
+                        let x = (touch.client_x() as f64 - rect.left()) as f32 * dpr;
+                        let y = (touch.client_y() as f64 - rect.top()) as f32 * dpr;
+                        a.cursor_pos = Vec2::new(x, y);
+                        a.mouse_pressed = true;
+                        a.last_mouse_pos = Some(Vec2::new(x, y));
+                    }
+                }
+            }
+        });
+        let opts = web_sys::AddEventListenerOptions::new();
+        opts.set_passive(false);
+        canvas.add_event_listener_with_callback_and_add_event_listener_options(
+            "touchstart", cb.as_ref().unchecked_ref(), &opts,
+        ).ok();
+        cb.forget();
+    }
+    {
+        let app = app.clone();
+        let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0) as f32;
+        let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
+            e.prevent_default();
+            if let Ok(mut a) = app.try_borrow_mut() {
+                if let Some(touch) = e.touches().get(0) {
+                    let rect = e.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                        .map(|el| el.get_bounding_client_rect());
+                    if let Some(rect) = rect {
+                        let x = (touch.client_x() as f64 - rect.left()) as f32 * dpr;
+                        let y = (touch.client_y() as f64 - rect.top()) as f32 * dpr;
+                        let current = Vec2::new(x, y);
+                        if let Some(last) = a.last_mouse_pos {
+                            let delta = current - last;
+                            a.camera.pan_by(delta);
+                        }
+                        a.last_mouse_pos = Some(current);
+                    }
+                }
+            }
+        });
+        let opts = web_sys::AddEventListenerOptions::new();
+        opts.set_passive(false);
+        canvas.add_event_listener_with_callback_and_add_event_listener_options(
+            "touchmove", cb.as_ref().unchecked_ref(), &opts,
+        ).ok();
+        cb.forget();
+    }
+    {
+        let app = app.clone();
+        let cb = Closure::<dyn FnMut(_)>::new(move |_: web_sys::TouchEvent| {
+            if let Ok(mut a) = app.try_borrow_mut() {
+                a.mouse_pressed = false;
+                a.last_mouse_pos = None;
+            }
+        });
+        canvas.add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref()).ok();
+        cb.forget();
+    }
+
+    // ── requestAnimationFrame loop ───────────────────────────────────
+    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    let g = f.clone();
+    let app_raf = app.clone();
+
+    *g.borrow_mut() = Some(Closure::new(move || {
+        if let Ok(mut a) = app_raf.try_borrow_mut() { a.tick(); }
+        // Schedule next frame
+        if let Some(win) = web_sys::window() {
+            let _ = win.request_animation_frame(
+                f.borrow().as_ref().unwrap().as_ref().unchecked_ref()
+            );
+        }
+    }));
+
+    // Kick off the first frame
+    if let Some(win) = web_sys::window() {
+        let _ = win.request_animation_frame(
+            g.borrow().as_ref().unwrap().as_ref().unchecked_ref()
+        );
+    }
 }
 
 /// Also keep the old auto-start for backward compatibility.

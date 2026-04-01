@@ -1,6 +1,6 @@
 # polymap
 
-3D map renderer powered by WebGPU/WASM. Available as a vanilla JS library and a Vue 3 component.
+3D map renderer powered by WebGPU/WASM.
 
 ## Installation
 
@@ -8,10 +8,10 @@
 npm install polymap
 ```
 
-## Vanilla JS
+## Usage
 
 ```js
-import { createPolyMap } from 'polymap/polymap';
+import { createPolyMap } from 'polymap';
 
 const map = await createPolyMap('#map', {
   center: { lat: 40.765, lon: -73.980 },
@@ -38,85 +38,69 @@ map.setTilt(1.0);
 // Toggle layers
 map.setLayerVisible('trees', false);
 map.setLayerVisible('shadows', false);
+
+// Theme colors
+map.setColors({
+  water: [0.06, 0.24, 0.29, 1.0],
+  park: [0.17, 0.19, 0.11, 1.0],
+  building: [0.29, 0.25, 0.15, 1.0],
+  road: [0.21, 0.10, 0.03, 1.0],
+  land: [0.82, 0.73, 0.55, 1.0],
+});
+
+// Cloud controls
+map.setCloudOpacity(0.5);
+map.setCloudSpeed(1.5);
 ```
 
-## Vue 3
+## API
 
-```vue
-<template>
-  <PolyMap
-    :center="{ lat: 40.765, lon: -73.980 }"
-    :zoom="1.0"
-    :tilt="1.35"
-    :markers="listings"
-    :layers="{ trees: true, shadows: true }"
-    width="100%"
-    height="600px"
-    @ready="onReady"
-    @marker:click="onMarkerClick"
-    @update:center="center = $event"
-    @update:zoom="zoom = $event"
-  >
-    <!-- Custom overlay that has access to the map instance -->
-    <template #overlay="{ map, camera }">
-      <div class="camera-info">
-        Zoom: {{ camera.zoom.toFixed(1) }}
-      </div>
-    </template>
-  </PolyMap>
-</template>
+### `createPolyMap(container, options)`
 
-<script setup>
-import { ref } from 'vue';
-import { PolyMap } from 'polymap';
+Creates a map instance inside a container element.
 
-const center = ref({ lat: 40.765, lon: -73.980 });
-const zoom = ref(1.0);
+**Options:**
 
-const listings = ref([
-  { id: 'apt-1', lat: 40.764, lon: -73.978, label: '$4.2M', className: 'listing-pin' },
-  { id: 'apt-2', lat: 40.766, lon: -73.982, label: '$1.8M' },
-]);
-
-function onReady(map) {
-  console.log('Map ready!', map.getCamera());
-}
-
-function onMarkerClick({ id }) {
-  console.log('Clicked:', id);
-}
-</script>
-```
-
-### Props
-
-| Prop | Type | Default | Description |
-|------|------|---------|-------------|
-| `center` | `{ lat, lon }` | `{ lat: 40.765, lon: -73.980 }` | Map center (two-way with `v-model:center`) |
-| `zoom` | `number` | `0.8` | Zoom level (two-way with `v-model:zoom`) |
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `center` | `{ lat, lon }` | `{ lat: 40.765, lon: -73.980 }` | Map center |
+| `zoom` | `number` | `0.8` | Zoom level |
 | `tilt` | `number` | `1.35` | Camera tilt in radians |
-| `markers` | `Array` | `[]` | Markers: `[{ id, lat, lon, html?, label?, className? }]` |
-| `layers` | `Object` | `{}` | Layer visibility: `{ buildings, roads, water, parks, trees, shadows, labels }` |
-| `width` | `string` | `'100%'` | Container width |
-| `height` | `string` | `'400px'` | Container height |
-| `dataUrl` | `string` | — | Custom data API URL |
+| `pmtilesUrl` | `string` | — | URL to PMTiles file |
 | `wasmUrl` | `string` | — | Custom WASM module URL |
+| `layers` | `Object` | `{}` | Layer visibility: `{ buildings, roads, water, parks, trees, shadows, labels, clouds }` |
+| `showControls` | `boolean` | `true` | Show the customize map controls panel |
+
+### Methods
+
+| Method | Description |
+|--------|-------------|
+| `setView(lat, lon, zoom?)` | Pan and zoom to position |
+| `setZoom(zoom)` | Set zoom level |
+| `setTilt(tilt)` | Set camera tilt (radians) |
+| `panBy(dx, dy)` | Pan by pixel offset |
+| `getCamera()` | Get `{ lat, lon, zoom, tilt }` |
+| `addMarker(id, lat, lon, options?)` | Add a marker |
+| `removeMarker(id)` | Remove a marker |
+| `clearMarkers()` | Remove all markers |
+| `setLayerVisible(layer, visible)` | Toggle layer visibility |
+| `setColors(config)` | Set color overrides `{ water, park, building, road, land }` |
+| `setCloudOpacity(opacity)` | Set cloud opacity (0.0–1.0) |
+| `setCloudSpeed(speed)` | Set cloud animation speed (0.0–3.0) |
+| `setBackgroundTexture(url)` | Set tiled background texture |
+| `setCloudTexture(url)` | Set cloud atlas texture |
+| `showControls()` | Show the customize map panel |
+| `hideControls()` | Hide the customize map panel |
+| `on(event, callback)` | Register event listener |
+| `off(event, callback?)` | Remove event listener |
+| `destroy()` | Clean up resources |
 
 ### Events
 
 | Event | Payload | Description |
 |-------|---------|-------------|
-| `ready` | `map` | Map initialized and first tiles loaded |
-| `camera:move` | `{ lat, lon, zoom, tilt }` | Camera position changed |
+| `ready` | `{ width, height, dpr }` | Map initialized |
+| `camera:move` | — | Camera settled after movement |
 | `click` | `{ screenX, screenY }` | Map clicked |
 | `resize` | `{ width, height }` | Map resized |
 | `marker:click` | `{ id, lat, lon, element }` | Marker clicked |
-| `update:center` | `{ lat, lon }` | Center changed (for v-model) |
-| `update:zoom` | `number` | Zoom changed (for v-model) |
-
-### Slots
-
-| Slot | Props | Description |
-|------|-------|-------------|
-| `overlay` | `{ map, camera }` | Custom overlay with access to map instance and camera state |
-| `markers` | `{ map, addMarker, removeMarker }` | Custom marker management |

@@ -17,6 +17,8 @@ pub enum Command {
     ClearMarkers,
     SetLayerVisible { layer: String, visible: bool },
     SetColors(ColorConfig),
+    SetCloudOpacity(f32),
+    SetCloudSpeed(f32),
     LoadBbox { south: f64, west: f64, north: f64, east: f64 },
     UploadBackgroundTexture {
         width: u32,
@@ -260,10 +262,34 @@ impl PolyMap {
 
     // ── Layers ────────────────────────────────────────────────────────
 
-    /// Toggle layer visibility. Layers: "buildings", "roads", "water", "parks", "trees", "shadows", "labels".
+    /// Toggle layer visibility. Layers: "buildings", "roads", "water", "parks", "trees", "shadows", "labels", "clouds".
     #[wasm_bindgen(js_name = setLayerVisible)]
     pub fn set_layer_visible(&self, layer: &str, visible: bool) {
         push_command(Command::SetLayerVisible { layer: layer.to_string(), visible });
+    }
+
+    /// Set cloud opacity (0.0 = invisible, 1.0 = full).
+    #[wasm_bindgen(js_name = setCloudOpacity)]
+    pub fn set_cloud_opacity(&self, opacity: f32) {
+        push_command(Command::SetCloudOpacity(opacity));
+    }
+
+    /// Set cloud animation speed (0.0 = frozen, 1.0 = default, 2.0 = double).
+    #[wasm_bindgen(js_name = setCloudSpeed)]
+    pub fn set_cloud_speed(&self, speed: f32) {
+        push_command(Command::SetCloudSpeed(speed));
+    }
+
+    /// Set map color overrides. Accepts an object with optional color arrays:
+    /// { water: [r,g,b,a], park: [r,g,b,a], building: [r,g,b,a], road: [r,g,b,a], land: [r,g,b,a] }
+    #[wasm_bindgen(js_name = setColors)]
+    pub fn set_colors(&self, config: JsValue) {
+        let parsed: ColorConfig = if config.is_undefined() || config.is_null() {
+            ColorConfig::default()
+        } else {
+            serde_wasm_bindgen::from_value(config).unwrap_or_default()
+        };
+        push_command(Command::SetColors(parsed));
     }
 
     // ── Events ────────────────────────────────────────────────────────

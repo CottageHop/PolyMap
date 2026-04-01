@@ -8,7 +8,16 @@ struct CameraUniform {
     zoom: f32,
     time: f32,
     tilt: f32,
-    _padding: f32,
+    cloud_opacity: f32,
+    cloud_speed: f32,
+    _pad2a: f32,
+    _pad2b: f32,
+    _pad2c: f32,
+    water_tint: vec4<f32>,
+    park_tint: vec4<f32>,
+    building_tint: vec4<f32>,
+    road_tint: vec4<f32>,
+    land_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)

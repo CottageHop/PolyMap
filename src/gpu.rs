@@ -4,8 +4,11 @@ use winit::window::Window;
 
 use crate::camera::CameraUniform;
 
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-pub const MSAA_SAMPLES: u32 = 4;
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
+/// Default MSAA sample count. Safari/iOS may not support 4x — GpuState
+/// detects supported counts at init and stores the actual value.
+pub const DEFAULT_MSAA_SAMPLES: u32 = 4;
 
 /// WebGPU `mappedAtCreation` size limit — buffers above this use the staging path.
 /// Some browsers/devices fail well under 1MB; use 256KB as a safe threshold.
@@ -50,9 +53,44 @@ pub struct GpuState {
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     pub depth_view: wgpu::TextureView,
     pub msaa_view: wgpu::TextureView,
+    pub msaa_samples: u32,
 }
 
 impl GpuState {
+    /// Create a GpuState from a canvas element directly (WASM).
+    /// This avoids re-entrant RefCell borrows in winit on Safari
+    /// by creating the surface outside of the event loop handler.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_from_canvas(canvas: web_sys::HtmlCanvasElement) -> Self {
+        let w = canvas.width();
+        let h = canvas.height();
+        let size = winit::dpi::PhysicalSize::new(w.max(1), h.max(1));
+
+        // Try WebGPU first, fall back to WebGL2 (for Safari < 17)
+        let (instance, surface) = {
+            let inst = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+                ..Default::default()
+            });
+            match inst.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())) {
+                Ok(s) => (inst, s),
+                Err(e) => {
+                    log::warn!("WebGPU surface failed ({e}), trying WebGL2 only");
+                    let inst = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                        backends: wgpu::Backends::GL,
+                        ..Default::default()
+                    });
+                    let s = inst
+                        .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+                        .expect("Neither WebGPU nor WebGL2 available");
+                    (inst, s)
+                }
+            }
+        };
+
+        Self::init(instance, surface, size).await
+    }
+
     pub async fn new(window: Arc<Window>) -> Self {
         let mut size = window.inner_size();
 
@@ -67,6 +105,15 @@ impl GpuState {
         });
 
         let surface = instance.create_surface(window).unwrap();
+
+        Self::init(instance, surface, size).await
+    }
+
+    async fn init(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Self {
 
         // Try high performance first, fall back to low power (integrated GPU)
         let adapter = match instance
@@ -111,6 +158,16 @@ impl GpuState {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        // Detect supported MSAA sample count (Safari/iOS may only support 1)
+        let msaa_samples = {
+            let features = adapter.get_texture_format_features(surface_format);
+            if features.flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4) {
+                DEFAULT_MSAA_SAMPLES
+            } else {
+                1
+            }
+        };
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -154,8 +211,8 @@ impl GpuState {
             }],
         });
 
-        let depth_view = create_depth_texture(&device, size.width, size.height);
-        let msaa_view = create_msaa_texture(&device, &config, size.width, size.height);
+        let depth_view = create_depth_texture(&device, size.width, size.height, msaa_samples);
+        let msaa_view = create_msaa_texture(&device, &config, size.width, size.height, msaa_samples);
 
         Self {
             surface,
@@ -168,6 +225,7 @@ impl GpuState {
             camera_bind_group_layout,
             depth_view,
             msaa_view,
+            msaa_samples,
         }
     }
 
@@ -177,13 +235,13 @@ impl GpuState {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            self.depth_view = create_depth_texture(&self.device, new_size.width, new_size.height);
-            self.msaa_view = create_msaa_texture(&self.device, &self.config, new_size.width, new_size.height);
+            self.depth_view = create_depth_texture(&self.device, new_size.width, new_size.height, self.msaa_samples);
+            self.msaa_view = create_msaa_texture(&self.device, &self.config, new_size.width, new_size.height, self.msaa_samples);
         }
     }
 }
 
-fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32, sample_count: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Depth Texture"),
         size: wgpu::Extent3d {
@@ -192,7 +250,7 @@ fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu:
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -206,6 +264,7 @@ fn create_msaa_texture(
     config: &wgpu::SurfaceConfiguration,
     width: u32,
     height: u32,
+    sample_count: u32,
 ) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("MSAA Color Texture"),
@@ -215,7 +274,7 @@ fn create_msaa_texture(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: MSAA_SAMPLES,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: config.format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
