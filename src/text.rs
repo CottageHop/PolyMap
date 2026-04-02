@@ -48,8 +48,8 @@ impl TextSystem {
     }
 }
 
-const ATLAS_SIZE: u32 = 1024;
-const FONT_SIZE: f32 = 32.0;
+const ATLAS_SIZE: u32 = 2048;
+const FONT_SIZE: f32 = 64.0;
 /// Tighten letter spacing (1.0 = normal, <1.0 = tighter)
 /// Global baseline kerning (applied at atlas level)
 const KERNING: f32 = 0.82;
@@ -287,11 +287,12 @@ impl TextSystem {
         };
 
         // Spatial grids for O(1) collision detection — separate grids so
-        // streets don't compete with city/park labels for placement
+        // streets, POIs, and city/park labels don't compete for placement
         let grid_cell = 2.0f32 * 2.0f32.powf(-zoom * 0.5);
         let mut grid_main: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
         let mut grid_streets: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let max_labels = 500;
+        let mut grid_pois: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let max_labels = 1500;
         let mut label_count = 0u32;
 
         // Sort labels by priority: Cities first, then Streets, then Parks, then rest
@@ -302,6 +303,7 @@ impl TextSystem {
             crate::mapdata::LabelKind::Street => 2,
             crate::mapdata::LabelKind::Park => 3,
             crate::mapdata::LabelKind::Building => 4,
+            crate::mapdata::LabelKind::Poi => 5,
         });
 
         for label in &sorted_labels {
@@ -316,6 +318,7 @@ impl TextSystem {
                 crate::mapdata::LabelKind::Park => -2.0,
                 crate::mapdata::LabelKind::Street => -10.0,
                 crate::mapdata::LabelKind::Building => 0.5,
+                crate::mapdata::LabelKind::Poi => 0.0,
             };
             if zoom < min_zoom {
                 continue;
@@ -323,15 +326,26 @@ impl TextSystem {
 
             let is_listing = matches!(label.kind, crate::mapdata::LabelKind::Listing);
             let is_street = matches!(label.kind, crate::mapdata::LabelKind::Street);
+            let is_poi = matches!(label.kind, crate::mapdata::LabelKind::Poi);
 
-            // Streets use a smaller grid cell (half size) so more labels fit
-            let cell = if is_street { grid_cell * 0.5 } else { grid_cell };
+            // Each label type gets its own grid cell size and collision grid
+            let cell = if is_street {
+                grid_cell * 0.3
+            } else if is_poi {
+                grid_cell * 0.25
+            } else {
+                grid_cell
+            };
             let gx = (label.position[0] / cell).floor() as i32;
             let gy = (label.position[1] / cell).floor() as i32;
 
-            // Streets use their own collision grid so they don't compete
-            // with city/park labels
-            let grid = if is_street { &mut grid_streets } else { &mut grid_main };
+            let grid = if is_street {
+                &mut grid_streets
+            } else if is_poi {
+                &mut grid_pois
+            } else {
+                &mut grid_main
+            };
 
             if !is_listing {
                 let occupied = (-1..=1).any(|dx| {
@@ -376,6 +390,59 @@ impl TextSystem {
                     );
                     continue;
                 }
+            }
+
+            // POI labels: wrap into multiple centered lines
+            if matches!(label.kind, crate::mapdata::LabelKind::Poi) {
+                let lines = wrap_text(&label.text, 14);
+                let line_height = self.font_size * scale * 1.2;
+                let total_h = line_height * lines.len() as f32;
+                let rotate = |x: f32, y: f32| -> (f32, f32) { (x, y) };
+
+                for (li, line) in lines.iter().enumerate() {
+                    let line_w: f32 = line.chars()
+                        .filter_map(|c| self.get_glyph(c))
+                        .map(|g| g.advance * scale * spacing)
+                        .sum();
+                    let line_y = -total_h * 0.5 + li as f32 * line_height;
+
+                    // Halo
+                    for &(ox, oy) in &[
+                        (-1.5_f32, 0.0_f32), (1.5, 0.0), (0.0, -1.5), (0.0, 1.5),
+                        (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0),
+                    ] {
+                        let mut cx = -line_w * 0.5 + ox;
+                        let cy = line_y + oy;
+                        for ch in line.chars() {
+                            if let Some(glyph) = self.get_glyph(ch) {
+                                self.emit_glyph_quad_rotated(
+                                    label.position,
+                                    cx + glyph.bearing[0] * scale,
+                                    cy + glyph.bearing[1] * scale,
+                                    glyph, scale, label_halo_color, &rotate,
+                                    &mut vertices, &mut indices,
+                                );
+                                cx += glyph.advance * scale * spacing;
+                            }
+                        }
+                    }
+                    // Text
+                    let mut cx = -line_w * 0.5;
+                    let cy = line_y;
+                    for ch in line.chars() {
+                        if let Some(glyph) = self.get_glyph(ch) {
+                            self.emit_glyph_quad_rotated(
+                                label.position,
+                                cx + glyph.bearing[0] * scale,
+                                cy + glyph.bearing[1] * scale,
+                                glyph, scale, label_text_color, &rotate,
+                                &mut vertices, &mut indices,
+                            );
+                            cx += glyph.advance * scale * spacing;
+                        }
+                    }
+                }
+                continue;
             }
 
             // Straight labels (non-road or fallback)
@@ -659,6 +726,44 @@ fn load_system_font() -> fontdue::Font {
         .expect("Failed to load embedded font")
 }
 
+/// Convert a coverage bitmap into a signed distance field.
+/// Positive values = inside the glyph, negative = outside.
+/// Normalized to 0-255 where 128 = edge.
+fn bitmap_to_sdf(bitmap: &[u8], w: u32, h: u32, spread: f32) -> Vec<u8> {
+    let w = w as i32;
+    let h = h as i32;
+    let search = spread.ceil() as i32;
+    let mut sdf = vec![0u8; (w * h) as usize];
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let inside = bitmap.get(idx).copied().unwrap_or(0) > 127;
+            let mut min_dist_sq = (search * search + 1) as f32;
+
+            // Search neighborhood for nearest edge pixel
+            for sy in (y - search).max(0)..=(y + search).min(h - 1) {
+                for sx in (x - search).max(0)..=(x + search).min(w - 1) {
+                    let si = (sy * w + sx) as usize;
+                    let s_inside = bitmap.get(si).copied().unwrap_or(0) > 127;
+                    if s_inside != inside {
+                        let dx = (sx - x) as f32;
+                        let dy = (sy - y) as f32;
+                        min_dist_sq = min_dist_sq.min(dx * dx + dy * dy);
+                    }
+                }
+            }
+
+            let dist = min_dist_sq.sqrt();
+            let signed = if inside { dist } else { -dist };
+            // Map to 0-255: 128 = edge, 255 = deep inside, 0 = far outside
+            let normalized = (signed / spread * 127.0 + 128.0).clamp(0.0, 255.0);
+            sdf[idx] = normalized as u8;
+        }
+    }
+    sdf
+}
+
 fn build_glyph_atlas(font: &fontdue::Font, font_size: f32) -> (Vec<u8>, HashMap<char, GlyphInfo>) {
     let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
     let mut glyphs = HashMap::new();
@@ -666,6 +771,7 @@ fn build_glyph_atlas(font: &fontdue::Font, font_size: f32) -> (Vec<u8>, HashMap<
     let mut cursor_x: u32 = 1;
     let mut cursor_y: u32 = 1;
     let mut row_height: u32 = 0;
+    let sdf_spread = 8.0_f32; // pixel radius for distance field
 
     for code in 32u8..127 {
         let ch = code as char;
@@ -675,7 +781,6 @@ fn build_glyph_atlas(font: &fontdue::Font, font_size: f32) -> (Vec<u8>, HashMap<
         let h = metrics.height as u32;
 
         if w == 0 || h == 0 {
-            // Space or empty glyph
             glyphs.insert(ch, GlyphInfo {
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
@@ -698,13 +803,16 @@ fn build_glyph_atlas(font: &fontdue::Font, font_size: f32) -> (Vec<u8>, HashMap<
             break;
         }
 
-        // Copy glyph bitmap into atlas
+        // Convert rasterized bitmap to SDF
+        let sdf = bitmap_to_sdf(&bitmap, w, h, sdf_spread);
+
+        // Copy SDF into atlas
         for y in 0..h {
             for x in 0..w {
                 let src_idx = (y * w + x) as usize;
                 let dst_idx = ((cursor_y + y) * ATLAS_SIZE + cursor_x + x) as usize;
-                if src_idx < bitmap.len() && dst_idx < atlas.len() {
-                    atlas[dst_idx] = bitmap[src_idx];
+                if src_idx < sdf.len() && dst_idx < atlas.len() {
+                    atlas[dst_idx] = sdf[src_idx];
                 }
             }
         }
@@ -777,4 +885,30 @@ fn sample_tangent(path: &[[f32; 2]], cum_len: &[f32], dist: f32) -> (f32, f32) {
     let len = (dx * dx + dy * dy).sqrt();
     if len < 1e-8 { return (1.0, 0.0); }
     (dx / len, dy / len)
+}
+
+/// Word-wrap text into lines of approximately `max_chars` characters.
+/// Breaks at spaces; words longer than max_chars are kept whole on their own line.
+fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() { return vec![text.to_string()]; }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in words {
+        if current.is_empty() {
+            current = word.to_string();
+        } else if current.len() + 1 + word.len() <= max_chars {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }

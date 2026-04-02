@@ -67,8 +67,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let coverage = textureSample(glyph_atlas, atlas_sampler, in.uv).r;
-    let alpha = smoothstep(0.1, 0.6, coverage) * in.color.a;
+    // SDF rendering: atlas stores signed distance (128 = edge, >128 = inside)
+    let dist = textureSample(glyph_atlas, atlas_sampler, in.uv).r;
+
+    // Screen-space anti-aliasing: 1-pixel smooth transition at any zoom
+    let aa = fwidth(dist) * 0.75;
+    let edge = 0.502; // 128/255 — the SDF edge threshold
+    let alpha = smoothstep(edge - aa, edge + aa, dist) * in.color.a;
 
     if alpha < 0.01 {
         discard;

@@ -530,11 +530,11 @@ function createControlsPanel(container, map) {
 
   const THEMES = {
     cottagecore: { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
-    cyberpunk:   { water:'#0a1628', park:'#1a0a12', building:'#2a1525', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0, clouds:false },
+    cyberpunk:   { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0, clouds:false },
     modern:      { water:'#42a5f5', park:'#8bc34a', building:'#e0e0e0', road:'#bdbdbd', land:'#f5f5f5', marker:'#1976d2', cloudOpacity:30, clouds:true },
     greyscale:   { water:'#888888', park:'#aaaaaa', building:'#666666', road:'#777777', land:'#f0f0f0', marker:'#444444', cloudOpacity:20, clouds:true },
     dark:        { water:'#1a3a4a', park:'#1e3a1e', building:'#2a2a2a', road:'#5a5a5a', land:'#1a1a1a', marker:'#e0e0e0', cloudOpacity:15, clouds:true },
-    eighties:    { water:'#0099dd', park:'#7bef2a', building:'#ff6347', road:'#ff1493', land:'#ffd732', marker:'#0099dd', cloudOpacity:0, clouds:false },
+    eighties:    { water:'#0099dd', park:'#7bef2a', building:'#e5573e', road:'#ff1493', land:'#ffd732', marker:'#0099dd', cloudOpacity:0, clouds:false },
     seventies:   { water:'#4ca8a8', park:'#f7c868', building:'#e87848', road:'#e03030', land:'#fdd998', marker:'#e03030', cloudOpacity:0, clouds:false },
     oldworld:    { water:'#5b7e8a', park:'#6b7c47', building:'#c4a265', road:'#8b4513', land:'#e8d5a3', marker:'#8b0000', cloudOpacity:0, clouds:false },
   };
