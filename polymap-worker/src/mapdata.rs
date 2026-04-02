@@ -87,17 +87,19 @@ pub enum LabelKind {
     Park,
     Building,
     Listing,
+    Poi,
 }
 
 impl Label {
     /// Font scale factor based on label type.
     pub fn font_scale(&self) -> f32 {
         match self.kind {
-            LabelKind::City => 2.5,
-            LabelKind::Street => 1.0,
-            LabelKind::Park => 1.0,
-            LabelKind::Building => 0.65,
-            LabelKind::Listing => 1.1,
+            LabelKind::City => 1.5,
+            LabelKind::Street => 0.38,
+            LabelKind::Park => 0.6,
+            LabelKind::Building => 0.4,
+            LabelKind::Listing => 0.65,
+            LabelKind::Poi => 0.18,
         }
     }
 
@@ -108,6 +110,7 @@ impl Label {
             LabelKind::Park => 1.1,
             LabelKind::Building => 1.0,
             LabelKind::Listing => 1.0,
+            LabelKind::Poi => 1.0,
         }
     }
 }
@@ -1846,6 +1849,101 @@ fn generate_cylinder(
         let tr = br + 1;
 
         indices.extend_from_slice(&[bl, br, tl, tl, br, tr]);
+    }
+}
+
+// --- POI 3D icon geometry ---
+
+const COLOR_POI_ORANGE: [f32; 4] = [0.93, 0.55, 0.15, 1.0];
+const COLOR_POI_GREEN: [f32; 4] = [0.30, 0.65, 0.20, 1.0];
+const COLOR_POI_BROWN: [f32; 4] = [0.55, 0.35, 0.20, 1.0];
+const COLOR_POI_RED: [f32; 4] = [0.85, 0.20, 0.20, 1.0];
+const COLOR_POI_WHITE: [f32; 4] = [0.95, 0.95, 0.95, 1.0];
+const COLOR_POI_BLUE: [f32; 4] = [0.25, 0.45, 0.80, 1.0];
+const COLOR_POI_YELLOW: [f32; 4] = [0.95, 0.85, 0.20, 1.0];
+const COLOR_POI_PINK: [f32; 4] = [0.90, 0.40, 0.55, 1.0];
+const COLOR_POI_GRAY: [f32; 4] = [0.60, 0.60, 0.60, 1.0];
+
+pub(crate) fn generate_poi_carrot(pos: [f32; 2], vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    let s = 1.2;
+    let segs = 8u32;
+    let base = vertices.len() as u32;
+    let pi = std::f32::consts::PI;
+    vertices.push(MapVertex::at_height(pos[0], pos[1], 0.15 * s, COLOR_POI_ORANGE, MAT_DEFAULT));
+    for i in 0..=segs {
+        let a = 2.0 * pi * i as f32 / segs as f32;
+        vertices.push(MapVertex::at_height(pos[0] + 0.3*s*a.cos(), pos[1] + 0.3*s*a.sin(), 1.0*s, COLOR_POI_ORANGE, MAT_DEFAULT));
+    }
+    for i in 0..segs { indices.extend_from_slice(&[base, base+1+i, base+2+i]); }
+    generate_sphere([pos[0], pos[1]], 1.1*s, 0.15*s, COLOR_POI_GREEN, MAT_DEFAULT, 6, 4, vertices, indices);
+    generate_sphere([pos[0]+0.06*s, pos[1]], 1.25*s, 0.10*s, COLOR_POI_GREEN, MAT_DEFAULT, 6, 4, vertices, indices);
+}
+
+pub(crate) fn generate_poi_cafe(pos: [f32; 2], vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    let s = 1.0;
+    generate_cylinder(pos, 0.3*s, 0.0, 0.7*s, COLOR_POI_WHITE, MAT_DEFAULT, 8, vertices, indices);
+    generate_sphere(pos, 0.65*s, 0.08*s, COLOR_POI_BROWN, MAT_DEFAULT, 6, 3, vertices, indices);
+}
+
+pub(crate) fn generate_poi_hospital(pos: [f32; 2], vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    let s = 1.0;
+    let h = 0.8*s; let w = 0.12*s; let l = 0.35*s;
+    for &(hw, hl) in &[(w, l), (l, w)] {
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]-hl, 0.0, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]-hl, 0.0, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]+hl, 0.0, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]+hl, 0.0, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]-hl, h, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]-hl, h, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]+hl, h, COLOR_POI_RED, MAT_DEFAULT));
+        vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]+hl, h, COLOR_POI_RED, MAT_DEFAULT));
+        indices.extend_from_slice(&[base,base+1,base+4, base+1,base+5,base+4]);
+        indices.extend_from_slice(&[base+2,base+6,base+3, base+3,base+6,base+7]);
+        indices.extend_from_slice(&[base+4,base+5,base+6, base+5,base+7,base+6]);
+    }
+}
+
+pub(crate) fn generate_poi_school(pos: [f32; 2], vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    let s = 1.0;
+    let hw = 0.3*s; let hd = 0.22*s; let h = 0.12*s;
+    let base = vertices.len() as u32;
+    vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]-hd, 0.0, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]-hd, 0.0, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]+hd, 0.0, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]+hd, 0.0, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]-hd, h, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]-hd, h, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]-hw, pos[1]+hd, h, COLOR_POI_BLUE, MAT_DEFAULT));
+    vertices.push(MapVertex::at_height(pos[0]+hw, pos[1]+hd, h, COLOR_POI_BLUE, MAT_DEFAULT));
+    indices.extend_from_slice(&[base,base+1,base+4, base+1,base+5,base+4]);
+    indices.extend_from_slice(&[base+2,base+6,base+3, base+3,base+6,base+7]);
+    indices.extend_from_slice(&[base+4,base+5,base+6, base+5,base+7,base+6]);
+    indices.extend_from_slice(&[base,base+2,base+1, base+1,base+2,base+3]);
+    indices.extend_from_slice(&[base,base+4,base+2, base+2,base+4,base+6]);
+    indices.extend_from_slice(&[base+1,base+3,base+5, base+3,base+7,base+5]);
+}
+
+pub(crate) fn generate_poi_restaurant(pos: [f32; 2], vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    let s = 1.0;
+    generate_cylinder(pos, 0.35*s, 0.0, 0.04*s, COLOR_POI_WHITE, MAT_DEFAULT, 10, vertices, indices);
+    generate_sphere(pos, 0.06*s, 0.12*s, COLOR_POI_YELLOW, MAT_DEFAULT, 6, 4, vertices, indices);
+}
+
+pub(crate) fn generate_poi_default(pos: [f32; 2], vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    let s = 0.8;
+    generate_cylinder(pos, 0.03*s, 0.0, 0.6*s, COLOR_POI_GRAY, MAT_DEFAULT, 6, vertices, indices);
+    generate_sphere(pos, 0.65*s, 0.12*s, COLOR_POI_PINK, MAT_DEFAULT, 6, 4, vertices, indices);
+}
+
+pub(crate) fn generate_poi_icon(pos: [f32; 2], kind: &str, vertices: &mut Vec<MapVertex>, indices: &mut Vec<u32>) {
+    match kind {
+        "supermarket" | "grocery" | "greengrocer" | "marketplace" => generate_poi_carrot(pos, vertices, indices),
+        "cafe" | "coffee" => generate_poi_cafe(pos, vertices, indices),
+        "hospital" | "clinic" | "doctors" | "pharmacy" | "dentist" => generate_poi_hospital(pos, vertices, indices),
+        "school" | "university" | "college" | "library" | "kindergarten" => generate_poi_school(pos, vertices, indices),
+        "restaurant" | "fast_food" | "food_court" | "bar" | "pub" | "biergarten" => generate_poi_restaurant(pos, vertices, indices),
+        _ => generate_poi_default(pos, vertices, indices),
     }
 }
 

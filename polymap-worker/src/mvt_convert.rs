@@ -7,7 +7,7 @@
 
 use crate::mapdata::{
     self, classify_road, expand_polygon,
-    generate_fountain, generate_line_geometry,
+    generate_fountain, generate_line_geometry, generate_poi_icon,
     is_closed, polygon_centroid, road_width,
     triangulate_polygon_at_height, Label, LabelKind, MapData, MapVertex, RoadType,
     COLOR_BUILDING, COLOR_COMMERCIAL, COLOR_INDUSTRIAL, COLOR_LAND,
@@ -161,6 +161,7 @@ pub fn mvt_to_mapdata(
     let mut road_lines: Vec<(Vec<[f32; 2]>, RoadType, Option<String>)> = Vec::with_capacity(64);
     let mut fountain_positions: Vec<[f32; 2]> = Vec::with_capacity(8);
     let mut tree_positions: Vec<[f32; 2]> = Vec::with_capacity(32);
+    let mut poi_icons: Vec<([f32; 2], String)> = Vec::with_capacity(32);
 
     // Process each MVT layer
     for layer in &tile.layers {
@@ -184,7 +185,7 @@ pub fn mvt_to_mapdata(
             ),
             "pois" if detail == DetailLevel::High => process_pois_layer(
                 layer, extent, z, x, y, center_lat, center_lon,
-                &mut fountain_positions, &mut tree_positions,
+                &mut fountain_positions, &mut tree_positions, &mut labels, &mut poi_icons,
             ),
             "places" => process_places_layer(
                 layer, extent, z, x, y, center_lat, center_lon,
@@ -550,6 +551,7 @@ pub fn mvt_to_mapdata(
         generate_fountain(*pos, Z_WATER, &mut vertices, &mut indices);
     }
 
+
     // No hard vertex cap — using queue.write_buffer avoids mappedAtCreation limits.
     // Building budget (80K verts) prevents unbounded growth in dense tiles.
     // Shadow cap only — prevent extreme shadow memory in dense areas
@@ -773,8 +775,7 @@ fn process_landuse_layer(
     }
 }
 
-/// Process the `pois` MVT layer. Extracts trees and fountains.
-/// Also logs all POI kinds on first call for debugging.
+/// Process the `pois` MVT layer. Extracts trees, fountains, and POI labels.
 fn process_pois_layer(
     layer: &Layer,
     extent: u32,
@@ -785,24 +786,35 @@ fn process_pois_layer(
     center_lon: f64,
     fountain_positions: &mut Vec<[f32; 2]>,
     tree_positions: &mut Vec<[f32; 2]>,
+    labels: &mut Vec<Label>,
+    poi_icons: &mut Vec<([f32; 2], String)>,
 ) {
-    let mut poi_kinds: Vec<&str> = Vec::new();
     for feature in &layer.features {
         let kind = feature.get_str(layer, "kind").unwrap_or("");
-        if !poi_kinds.contains(&kind) { poi_kinds.push(kind); }
-        if kind != "fountain" && kind != "tree" {
-            continue;
-        }
 
-        // Use the first point of the first ring as the position
         if let Some(ring) = feature.geometry.first() {
             if let Some(&pt) = ring.first() {
+                if centroid_outside_tile(&[pt], extent) { continue; }
                 let (lat, lon) = tile_to_latlon(pt[0], pt[1], extent, z, x, y);
                 let pos = mapdata::project(lat, lon, center_lat, center_lon);
+
                 match kind {
                     "fountain" => fountain_positions.push(pos),
-                    "tree" => tree_positions.push(pos),
-                    _ => {}
+                    "tree" => {}
+                    _ => {
+                        if let Some(name) = feature.get_str(layer, "name") {
+                            if !name.is_empty() {
+                                labels.push(Label {
+                                    text: name.to_string(),
+                                    position: pos,
+                                    angle: 0.0,
+                                    kind: LabelKind::Poi,
+                                    path: None,
+                                });
+                                poi_icons.push((pos, kind.to_string()));
+                            }
+                        }
+                    }
                 }
             }
         }
