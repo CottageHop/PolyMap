@@ -244,11 +244,11 @@ impl TextSystem {
 
     /// Generate text quads for all labels and upload to GPU.
     pub fn upload_labels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label]) {
-        self.upload_labels_at_zoom(device, queue, labels, 1.0);
+        self.upload_labels_at_zoom(device, queue, labels, 1.0, 1000.0);
     }
 
-    pub fn upload_labels_at_zoom(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label], zoom: f32) {
-        self.upload_labels_themed(device, queue, labels, zoom, [0.0; 4], [0.0; 4]);
+    pub fn upload_labels_at_zoom(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label], zoom: f32, viewport_min: f32) {
+        self.upload_labels_themed(device, queue, labels, zoom, [0.0; 4], [0.0; 4], viewport_min);
     }
 
     pub fn upload_labels_themed(
@@ -259,6 +259,7 @@ impl TextSystem {
         zoom: f32,
         road_tint: [f32; 4],
         land_tint: [f32; 4],
+        viewport_min: f32,
     ) {
         let mut vertices: Vec<TextVertex> = Vec::with_capacity(256 * 20);
         let mut indices: Vec<u32> = Vec::with_capacity(256 * 30);
@@ -287,8 +288,12 @@ impl TextSystem {
         };
 
         // Spatial grids for O(1) collision detection — separate grids so
-        // streets, POIs, and city/park labels don't compete for placement
-        let grid_cell = 2.0f32 * 2.0f32.powf(-zoom * 0.5);
+        // streets, POIs, and city/park labels don't compete for placement.
+        // Labels are fixed pixel size (shader is zoom-only), but a fixed-pixel
+        // label occupies more world-space on a smaller viewport. Scale cells
+        // inversely with viewport so fewer labels pass on small screens.
+        let vp_scale = 1000.0 / viewport_min.max(1.0);
+        let grid_cell = 2.0f32 * 2.0f32.powf(-zoom * 0.5) * vp_scale;
         let mut grid_main: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
         let mut grid_streets: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
         let mut grid_pois: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
@@ -386,6 +391,7 @@ impl TextSystem {
                     self.emit_curved_label(
                         path, &label.text, &label.position, scale, spacing, total_width, zoom,
                         label_text_color, label_halo_color,
+                        viewport_min,
                         &mut vertices, &mut indices,
                     );
                     continue;
@@ -564,6 +570,7 @@ impl TextSystem {
         zoom: f32,
         text_color: [f32; 4],
         halo_color: [f32; 4],
+        viewport_min: f32,
         vertices: &mut Vec<TextVertex>,
         indices: &mut Vec<u32>,
     ) {
@@ -603,10 +610,13 @@ impl TextSystem {
         if glyphs.is_empty() { return; }
 
         // Convert pixel advance to world units, matching the text shader's zoom scaling.
-        // Derived from: shader zoom_scale = 2^(z*0.5) * (1000/ref_size),
-        // ortho projection scale = 100 / 2^z, ref_size = 1000.
-        // Result: world_per_pixel = 0.2 / 2^(zoom * 0.5)
-        let world_per_px = 0.05 / 2.0_f32.powf(zoom * 0.5);
+        // Shader zoom_scale = 2^(z*0.5), ortho projection scale = 100 / 2^z.
+        // Derivation: world_per_pixel_screen = 100 / (viewport * pow(2, z*0.5)).
+        // Constant 0.1 comes from 100 / 1000 (the viewport_min normalizer).
+        // Previously 0.05 was tuned for the old shader's extra (1000/ref_size) factor;
+        // with that removed, the correct base is 0.1.
+        let vp_scale = 1000.0 / viewport_min.max(1.0);
+        let world_per_px = 0.1 / 2.0_f32.powf(zoom * 0.5) * vp_scale;
 
         // Starting distance along the path (center the text on the anchor)
         let start_dist = anchor_dist - total_width_px * world_per_px * 0.5;

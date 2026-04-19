@@ -49,11 +49,10 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let anchor_clip = camera.view_proj * vec4<f32>(in.world_pos.x, in.world_pos.y, 0.0, 1.0);
     let ndc = anchor_clip.xy / anchor_clip.w;
 
-    // Scale labels by zoom level. The pixel_to_ndc conversion already accounts for
-    // viewport size (larger viewport = smaller NDC per pixel), so we only need zoom scaling.
-    // Use min dimension as reference to keep labels consistent regardless of aspect ratio.
-    let ref_size = min(camera.viewport.x, camera.viewport.y);
-    let zoom_scale = pow(2.0, camera.zoom * 0.5) * (1000.0 / ref_size);
+    // Scale labels by zoom level only — fixed pixel size regardless of window.
+    // The pixel_to_ndc conversion handles viewport→NDC mapping;
+    // zoom_scale makes labels track road/building scale as you zoom.
+    let zoom_scale = pow(2.0, camera.zoom * 0.5);
     let pixel_to_ndc = vec2<f32>(2.0 / camera.viewport.x, -2.0 / camera.viewport.y) * zoom_scale;
     let final_pos = ndc + in.pixel_offset * pixel_to_ndc;
 

@@ -758,8 +758,9 @@ impl ApplicationHandler for App {
 
                         if should_rebuild {
                             let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
+                            let viewport_min = gpu.size.width.min(gpu.size.height) as f32;
                             if let Some(renderer) = &mut self.renderer {
-                                renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint);
+                                renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint, viewport_min);
                             }
                             self.last_label_zoom = self.camera.zoom;
                             self.labels_dirty = false;
@@ -990,8 +991,9 @@ impl App {
                     || (self.labels_dirty && camera_settled);
                 if should_rebuild {
                     let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
+                    let viewport_min = gpu.size.width.min(gpu.size.height) as f32;
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint);
+                        renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint, viewport_min);
                     }
                     self.last_label_zoom = self.camera.zoom;
                     self.labels_dirty = false;
