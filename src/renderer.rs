@@ -1,3 +1,4 @@
+use crate::cars::CarsSystem;
 use crate::config::LayerVisibility;
 use crate::gpu::GpuState;
 use crate::mapdata::{MapData, MapVertex};
@@ -15,6 +16,7 @@ pub struct Renderer {
     shadow_index_buffer: Option<wgpu::Buffer>,
     num_shadow_indices: u32,
     pub text: TextSystem,
+    pub cars: CarsSystem,
     pub textures: TextureSystem,
 }
 
@@ -224,6 +226,8 @@ impl Renderer {
             gpu.msaa_samples,
         );
 
+        let cars = CarsSystem::new(gpu);
+
         Self {
             map_pipeline,
             shadow_pipeline,
@@ -235,6 +239,7 @@ impl Renderer {
             shadow_index_buffer: None,
             num_shadow_indices: 0,
             text,
+            cars,
             textures,
         }
     }
@@ -358,12 +363,17 @@ impl Renderer {
                 }
             }
 
-            // Pass 3: Text labels
+            // Pass 3: Cars
+            if layers.cars {
+                self.cars.render(&mut render_pass, &gpu.camera_bind_group);
+            }
+
+            // Pass 4: Text labels
             if layers.labels {
                 self.text.render(&mut render_pass, &gpu.camera_bind_group);
             }
 
-            // Pass 4: Procedural cloud overlay (fullscreen)
+            // Pass 5: Procedural cloud overlay (fullscreen)
             if layers.clouds {
                 self.render_clouds(&mut render_pass, &gpu.camera_bind_group);
             }
@@ -381,6 +391,7 @@ impl Renderer {
         tiles: impl Iterator<Item = &'a crate::tiles::LoadedTile>,
         layers: &LayerVisibility,
         clear_color: [f64; 3],
+        camera_zoom: f32,
     ) -> Result<(), wgpu::SurfaceError> {
         if gpu.config.width == 0 || gpu.config.height == 0 {
             return Ok(());
@@ -445,8 +456,10 @@ impl Renderer {
                 render_pass.draw_indexed(0..tile.num_indices, 0, 0..1);
             }
 
-            // Pass 2: Shadows
-            if layers.shadows {
+            // Pass 2: Shadows — skip at low zoom where shadows are pixel-dust anyway.
+            // Saves ~40-50% GPU time when zoomed out since shadow pass is near-parity
+            // vertex count with the main pass.
+            if layers.shadows && camera_zoom >= 1.0 {
                 render_pass.set_pipeline(&self.shadow_pipeline);
                 render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
                 render_pass.set_bind_group(1, self.textures.material_bind_group().unwrap(), &[]);
@@ -461,12 +474,17 @@ impl Renderer {
                 }
             }
 
-            // Pass 3: Text labels
+            // Pass 3: Cars
+            if layers.cars {
+                self.cars.render(&mut render_pass, &gpu.camera_bind_group);
+            }
+
+            // Pass 4: Text labels
             if layers.labels {
                 self.text.render(&mut render_pass, &gpu.camera_bind_group);
             }
 
-            // Pass 4: Procedural cloud overlay (fullscreen)
+            // Pass 5: Procedural cloud overlay (fullscreen)
             if layers.clouds {
                 self.render_clouds(&mut render_pass, &gpu.camera_bind_group);
             }

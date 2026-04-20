@@ -57,6 +57,7 @@ pub struct LayerConfig {
     pub labels: Option<bool>,
     pub parcels: Option<bool>,
     pub clouds: Option<bool>,
+    pub cars: Option<bool>,
 }
 
 /// Runtime layer visibility state.
@@ -71,6 +72,7 @@ pub struct LayerVisibility {
     pub labels: bool,
     pub parcels: bool,
     pub clouds: bool,
+    pub cars: bool,
 }
 
 impl Default for LayerVisibility {
@@ -85,6 +87,9 @@ impl Default for LayerVisibility {
             labels: true,
             parcels: true,
             clouds: true,
+            // Cars are an experimental feature — off by default, toggle via
+            // setLayerVisible('cars', true) in devtools.
+            cars: false,
         }
     }
 }
@@ -100,5 +105,6 @@ impl LayerVisibility {
         if let Some(v) = config.labels { self.labels = v; }
         if let Some(v) = config.parcels { self.parcels = v; }
         if let Some(v) = config.clouds { self.clouds = v; }
+        if let Some(v) = config.cars { self.cars = v; }
     }
 }

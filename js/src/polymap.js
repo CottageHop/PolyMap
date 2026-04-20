@@ -569,6 +569,8 @@ function createControlsPanel(container, map) {
   const style = document.createElement('style');
   style.textContent = `
     .polymap-controls.collapsed .pm-body,.polymap-controls.collapsed .pm-title{display:none}
+    .polymap-controls.collapsed{width:auto !important}
+    .polymap-controls.collapsed .pm-header{border-bottom:none;padding:8px 10px}
     .pm-header{display:flex;align-items:center;padding:10px 12px;gap:8px;border-bottom:1px solid rgba(0,0,0,0.06);cursor:pointer;user-select:none}
     .pm-header:hover{background:rgba(0,0,0,0.03)}
     .pm-section{padding:6px 14px 10px}

@@ -12,7 +12,7 @@ struct CameraUniform {
     tilt: f32,
     cloud_opacity: f32,
     cloud_speed: f32,
-    _pad2a: f32,
+    label_alpha: f32,
     _pad2b: f32,
     _pad2c: f32,
     water_tint: vec4<f32>,

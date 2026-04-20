@@ -1,4 +1,5 @@
 pub mod camera;
+pub mod cars;
 pub mod config;
 pub mod gpu;
 pub mod mapdata;
@@ -73,6 +74,10 @@ pub struct App {
     last_label_zoom: f32,
     frames_since_camera_moved: u32,
     first_render_done: bool,
+    /// Current label opacity, eased toward a target each frame so labels
+    /// fade out while the camera is moving (hiding the lag between the
+    /// gesture and the rebuild) and fade back in once the camera settles.
+    label_fade: f32,
     /// Frames since GPU was initialized — used to re-sync canvas size on WASM
     frames_since_gpu_init: u32,
     #[cfg(target_arch = "wasm32")]
@@ -126,6 +131,7 @@ impl App {
             last_label_zoom: -999.0,
             frames_since_camera_moved: 0,
             first_render_done: false,
+            label_fade: 1.0,
             frames_since_gpu_init: 0,
             #[cfg(target_arch = "wasm32")]
             gpu_pending: None,
@@ -233,6 +239,7 @@ impl App {
                             "shadows" => self.layer_visibility.shadows = visible,
                             "labels" => self.layer_visibility.labels = visible,
                             "clouds" => self.layer_visibility.clouds = visible,
+                            "cars" => self.layer_visibility.cars = visible,
                             _ => log::warn!("Unknown layer: {}", layer),
                         }
                     }
@@ -356,6 +363,7 @@ impl App {
                                 shadow_index_buffer: shadow_ib,
                                 num_shadow_indices: num_shadow,
                                 labels,
+                                cars: Vec::new(),
                                 last_visible_frame: 0,
                                 z14_tile: z14,
                             };
@@ -746,15 +754,16 @@ impl ApplicationHandler for App {
                             tm.update_visibility(&visible);
                         }
 
-                        // Re-upload labels when:
-                        // 1. New tiles arrived, OR
-                        // 2. Zoom changed (rebuild immediately — don't wait for settle)
-                        // 3. Camera settled after panning
+                        // New tiles or zoom changes dirty labels but we defer the
+                        // actual rebuild until the camera settles — cloning all
+                        // labels across 100+ tiles is ~5ms per call, too slow to
+                        // do every frame during pan or zoom.
                         let zoom_changed = (self.camera.zoom - self.last_label_zoom).abs() > 0.1;
+                        if tm.tiles_changed || zoom_changed {
+                            self.labels_dirty = true;
+                        }
                         let camera_settled = self.frames_since_camera_moved > 10;
-                        let should_rebuild = tm.tiles_changed
-                            || zoom_changed
-                            || (self.labels_dirty && camera_settled);
+                        let should_rebuild = self.labels_dirty && camera_settled;
 
                         if should_rebuild {
                             let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
@@ -782,6 +791,16 @@ impl ApplicationHandler for App {
                         api::emit_event("camera:move", &wasm_bindgen::JsValue::UNDEFINED);
                     }
                     self.frames_since_camera_moved = self.frames_since_camera_moved.saturating_add(1);
+                }
+
+                // Update car positions (needs &mut renderer) before the render block's immutable borrow.
+                if self.layer_visibility.cars {
+                    if let (Some(gpu), Some(renderer), Some(tm)) =
+                        (&self.gpu, self.renderer.as_mut(), self.tile_manager.as_ref())
+                    {
+                        let cars_iter = tm.loaded_tiles().flat_map(|t| t.cars.iter());
+                        renderer.cars.update(gpu, cars_iter, elapsed);
+                    }
                 }
 
                 if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
@@ -822,6 +841,8 @@ impl ApplicationHandler for App {
                     let has_loading_tiles = self.use_tiles && self.tile_manager.as_ref()
                         .map_or(false, |tm| tm.tiles.values().any(|s| matches!(s, crate::tiles::TileState::Loading)));
                     let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
+                    let cars_animating = self.layer_visibility.cars && self.use_tiles && self.tile_manager.as_ref()
+                        .map_or(false, |tm| tm.loaded_tiles().any(|t| !t.cars.is_empty()));
                     let needs_render = camera_moved
                         || self.frames_since_camera_moved < 3
                         || (self.use_tiles && self.tile_manager.as_ref().map_or(false, |tm| tm.tiles_changed))
@@ -831,16 +852,23 @@ impl ApplicationHandler for App {
                         || !self.ready_emitted
                         || !self.first_render_done
                         || self.frames_since_gpu_init < 300
-                        || clouds_animating;
+                        || clouds_animating
+                        || cars_animating;
 
                     if !needs_render {
                         return;
                     }
                     self.first_render_done = true;
 
+                    // Ease label_fade toward 0.4 during camera motion, 1.0 when settled.
+                    // Mask for the label rebuild lag so stale labels don't linger at full opacity.
+                    let label_target = if self.frames_since_camera_moved <= 10 { 0.4 } else { 1.0 };
+                    self.label_fade += (label_target - self.label_fade) * 0.3;
+
                     let mut uniform = self.camera.uniform(elapsed);
                     uniform.cloud_opacity = self.cloud_opacity;
                     uniform.cloud_speed = self.cloud_speed;
+                    uniform.label_alpha = self.label_fade;
                     uniform.water_tint = self.water_tint;
                     uniform.park_tint = self.park_tint;
                     uniform.building_tint = self.building_tint;
@@ -860,7 +888,8 @@ impl ApplicationHandler for App {
 
                     let render_result = if self.use_tiles {
                         if let Some(tm) = &self.tile_manager {
-                            renderer.render_tiles(gpu, tm.loaded_tiles(), &self.layer_visibility, clear)
+                            let cam_aabb = self.camera.world_aabb();
+                            renderer.render_tiles(gpu, tm.loaded_tiles_in_aabb(cam_aabb), &self.layer_visibility, clear, self.camera.zoom)
                         } else {
                             renderer.render(gpu, &self.layer_visibility, clear)
                         }
@@ -984,11 +1013,16 @@ impl App {
                     tm.request_visible_tiles(&visible);
                     tm.update_visibility(&visible);
                 }
+                // New tiles and zoom changes both dirty the labels, but we wait
+                // for camera settle before rebuilding — `all_labels().cloned().collect()`
+                // over 100+ tiles is ~5ms and produces a visible stutter if fired
+                // every frame during pan OR zoom gestures.
                 let zoom_changed = (self.camera.zoom - self.last_label_zoom).abs() > 0.1;
+                if tm.tiles_changed || zoom_changed {
+                    self.labels_dirty = true;
+                }
                 let camera_settled = self.frames_since_camera_moved > 10;
-                let should_rebuild = tm.tiles_changed
-                    || zoom_changed
-                    || (self.labels_dirty && camera_settled);
+                let should_rebuild = self.labels_dirty && camera_settled;
                 if should_rebuild {
                     let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
                     let viewport_min = gpu.size.width.min(gpu.size.height) as f32;
@@ -1012,6 +1046,16 @@ impl App {
                 api::emit_event("camera:move", &wasm_bindgen::JsValue::UNDEFINED);
             }
             self.frames_since_camera_moved = self.frames_since_camera_moved.saturating_add(1);
+        }
+
+        // Update car positions (needs &mut renderer) before the render block's immutable borrow.
+        if self.layer_visibility.cars {
+            if let (Some(gpu), Some(renderer), Some(tm)) =
+                (&self.gpu, self.renderer.as_mut(), self.tile_manager.as_ref())
+            {
+                let cars_iter = tm.loaded_tiles().flat_map(|t| t.cars.iter());
+                renderer.cars.update(gpu, cars_iter, elapsed);
+            }
         }
 
         if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
@@ -1054,9 +1098,14 @@ impl App {
             if !needs_render { return; }
             self.first_render_done = true;
 
+            // Ease label_fade toward 0.4 during camera motion, 1.0 when settled.
+            let label_target = if self.frames_since_camera_moved <= 10 { 0.4 } else { 1.0 };
+            self.label_fade += (label_target - self.label_fade) * 0.3;
+
             let mut uniform = self.camera.uniform(elapsed);
             uniform.cloud_opacity = self.cloud_opacity;
             uniform.cloud_speed = self.cloud_speed;
+            uniform.label_alpha = self.label_fade;
             uniform.water_tint = self.water_tint;
             uniform.park_tint = self.park_tint;
             uniform.building_tint = self.building_tint;
@@ -1072,7 +1121,8 @@ impl App {
 
             let render_result = if self.use_tiles {
                 if let Some(tm) = &self.tile_manager {
-                    renderer.render_tiles(gpu, tm.loaded_tiles(), &self.layer_visibility, clear)
+                    let cam_aabb = self.camera.world_aabb();
+                    renderer.render_tiles(gpu, tm.loaded_tiles_in_aabb(cam_aabb), &self.layer_visibility, clear, self.camera.zoom)
                 } else {
                     renderer.render(gpu, &self.layer_visibility, clear)
                 }

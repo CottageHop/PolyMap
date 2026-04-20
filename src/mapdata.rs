@@ -83,7 +83,9 @@ pub struct Label {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum LabelKind {
+    State,
     City,
+    Subdivision,
     Street,
     Park,
     Building,
@@ -95,7 +97,9 @@ impl Label {
     /// Font scale factor based on label type.
     pub fn font_scale(&self) -> f32 {
         match self.kind {
+            LabelKind::State => 2.0,
             LabelKind::City => 1.5,
+            LabelKind::Subdivision => 0.9,
             LabelKind::Street => 0.38,
             LabelKind::Park => 0.6,
             LabelKind::Building => 0.4,
@@ -107,7 +111,9 @@ impl Label {
     /// Extra letter spacing multiplier (1.0 = normal, >1 = wider)
     pub fn letter_spacing(&self) -> f32 {
         match self.kind {
+            LabelKind::State => 1.5,
             LabelKind::City => 1.35,
+            LabelKind::Subdivision => 1.25,
             LabelKind::Street => 1.35,
             LabelKind::Park => 1.1,
             LabelKind::Building => 1.0,
@@ -138,6 +144,17 @@ pub struct PlacedListing {
     pub world_pos: [f32; 2],
 }
 
+/// One car travelling along a road polyline.
+/// `offset` and `speed` are measured in world units.
+#[derive(Clone, Debug)]
+pub struct Car {
+    pub path: Vec<[f32; 2]>,
+    pub path_length: f32,
+    pub offset: f32,
+    pub speed: f32,
+    pub color: [f32; 3],
+}
+
 /// All GPU-ready map geometry.
 #[derive(Clone)]
 pub struct MapData {
@@ -147,6 +164,7 @@ pub struct MapData {
     pub shadow_indices: Vec<u32>,
     pub labels: Vec<Label>,
     pub listings: Vec<PlacedListing>,
+    pub cars: Vec<Car>,
     pub center_lat: f64,
     pub center_lon: f64,
 }
@@ -998,6 +1016,7 @@ pub fn parse_osm_json_centered(
         shadow_indices,
         labels,
         listings: Vec::new(),
+        cars: Vec::new(),
         center_lat,
         center_lon,
     })

@@ -564,6 +564,53 @@ pub fn mvt_to_mapdata(
         shadow_indices.truncate(tri_count * 3);
     }
 
+    // Cars: spawn one per major/minor road long enough to be visually interesting.
+    // Experiment scope — no effort at realistic routing, just cars drifting along polylines.
+    let mut cars: Vec<crate::mapdata::Car> = Vec::new();
+    let car_palette: [[f32; 3]; 6] = [
+        [0.85, 0.20, 0.20], // red
+        [0.20, 0.35, 0.75], // blue
+        [0.95, 0.85, 0.15], // yellow
+        [0.15, 0.15, 0.15], // black
+        [0.90, 0.90, 0.90], // white
+        [0.25, 0.55, 0.30], // green
+    ];
+    for (coords, road_type, _) in &road_lines {
+        if matches!(road_type, RoadType::Path | RoadType::Rail) { continue; }
+        if coords.len() < 2 { continue; }
+
+        let mut path_length = 0.0f32;
+        for i in 0..coords.len() - 1 {
+            let dx = coords[i + 1][0] - coords[i][0];
+            let dy = coords[i + 1][1] - coords[i][1];
+            path_length += (dx * dx + dy * dy).sqrt();
+        }
+        if path_length < 12.0 { continue; } // skip tiny residential stubs
+
+        let base_speed = match road_type {
+            RoadType::Major => 22.0,
+            _ => 14.0,
+        };
+        // One car per ~80 world units of major road, 120 units of minor
+        let spacing = if matches!(road_type, RoadType::Major) { 80.0 } else { 140.0 };
+        let n = ((path_length / spacing).floor() as usize).max(1);
+
+        // Deterministic pseudo-random seed from the first coord — stable per tile
+        let seed_hash = (coords[0][0].to_bits() ^ coords[0][1].to_bits()) as usize;
+        for k in 0..n {
+            let phase = k as f32 / n as f32;
+            let speed_jitter = ((seed_hash.wrapping_add(k * 31)) % 100) as f32 / 100.0;
+            let color = car_palette[(seed_hash.wrapping_add(k * 7)) % car_palette.len()];
+            cars.push(crate::mapdata::Car {
+                path: coords.clone(),
+                path_length,
+                offset: phase * path_length,
+                speed: base_speed * (0.75 + speed_jitter * 0.5),
+                color,
+            });
+        }
+    }
+
     MapData {
         vertices,
         indices,
@@ -571,6 +618,7 @@ pub fn mvt_to_mapdata(
         shadow_indices,
         labels,
         listings: Vec::new(),
+        cars,
         center_lat,
         center_lon,
     }

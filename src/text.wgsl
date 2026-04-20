@@ -10,7 +10,7 @@ struct CameraUniform {
     tilt: f32,
     cloud_opacity: f32,
     cloud_speed: f32,
-    _pad2a: f32,
+    label_alpha: f32,
     _pad2b: f32,
     _pad2c: f32,
     water_tint: vec4<f32>,
@@ -66,13 +66,31 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // SDF rendering: atlas stores signed distance (128 = edge, >128 = inside)
-    let dist = textureSample(glyph_atlas, atlas_sampler, in.uv).r;
+    // 4-tap rotated-grid supersample for crisper SDF edges.
+    // We sample the distance field at four sub-pixel offsets, apply the edge
+    // threshold to each, then average the resulting alphas — "analytical AA"
+    // that eliminates the jagged/pixelated look on zoomed text without losing
+    // sharpness.
+    let dvx = dpdx(in.uv) * 0.354; // sqrt(2)/4 for rotated-grid positions
+    let dvy = dpdy(in.uv) * 0.354;
+    let d0 = textureSample(glyph_atlas, atlas_sampler, in.uv + dvx + dvy).r;
+    let d1 = textureSample(glyph_atlas, atlas_sampler, in.uv + dvx - dvy).r;
+    let d2 = textureSample(glyph_atlas, atlas_sampler, in.uv - dvx + dvy).r;
+    let d3 = textureSample(glyph_atlas, atlas_sampler, in.uv - dvx - dvy).r;
 
-    // Screen-space anti-aliasing: 1-pixel smooth transition at any zoom
-    let aa = fwidth(dist) * 0.75;
     let edge = 0.502; // 128/255 — the SDF edge threshold
-    let alpha = smoothstep(edge - aa, edge + aa, dist) * in.color.a;
+    // Narrower smoothstep than before (0.5 vs 0.75 * fwidth) for sharper edges;
+    // the 4x supersampling absorbs the aliasing that a narrow filter would
+    // otherwise introduce.
+    let aa = fwidth(d0) * 0.5;
+    let a0 = smoothstep(edge - aa, edge + aa, d0);
+    let a1 = smoothstep(edge - aa, edge + aa, d1);
+    let a2 = smoothstep(edge - aa, edge + aa, d2);
+    let a3 = smoothstep(edge - aa, edge + aa, d3);
+
+    // label_alpha is <1.0 during camera motion to hide the lag between the
+    // gesture and the label rebuild; fades smoothly back to 1.0 on settle.
+    let alpha = (a0 + a1 + a2 + a3) * 0.25 * in.color.a * camera.label_alpha;
 
     if alpha < 0.01 {
         discard;

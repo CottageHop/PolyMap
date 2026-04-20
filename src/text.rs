@@ -287,28 +287,34 @@ impl TextSystem {
             ([0.0_f32, 0.0, 0.0, 0.9], [1.0_f32, 1.0, 1.0, 0.8])
         };
 
-        // Spatial grids for O(1) collision detection — separate grids so
-        // streets, POIs, and city/park labels don't compete for placement.
-        // Labels are fixed pixel size (shader is zoom-only), but a fixed-pixel
-        // label occupies more world-space on a smaller viewport. Scale cells
-        // inversely with viewport so fewer labels pass on small screens.
+        // Real world-space AABB collision. Replaces the old spatial-grid
+        // heuristic — we now measure each label's actual visual extent and
+        // do rectangle-rectangle intersection tests, so labels can't visually
+        // overlap regardless of their size differences.
+        // world_per_px matches the curved-label placement derivation so our
+        // collision bounds correspond to actual rendered pixel extents.
         let vp_scale = 1000.0 / viewport_min.max(1.0);
-        let grid_cell = 2.0f32 * 2.0f32.powf(-zoom * 0.5) * vp_scale;
-        let mut grid_main: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let mut grid_streets: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let mut grid_pois: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let world_per_px = 0.1 / 2.0_f32.powf(zoom * 0.5) * vp_scale;
+
+        struct LabelAabb {
+            min_x: f32, max_x: f32, min_y: f32, max_y: f32,
+        }
+        let mut accepted: Vec<LabelAabb> = Vec::with_capacity(512);
         let max_labels = 1500;
         let mut label_count = 0u32;
 
-        // Sort labels by priority: Cities first, then Streets, then Parks, then rest
+        // Priority order (lowest number = highest priority):
+        // State > City > Subdivision > Listing > Park > Street (Road) > Poi (Business) > Building
         let mut sorted_labels: Vec<&Label> = labels.iter().collect();
         sorted_labels.sort_by_key(|l| match l.kind {
-            crate::mapdata::LabelKind::City => 0,
-            crate::mapdata::LabelKind::Listing => 1,
-            crate::mapdata::LabelKind::Street => 2,
-            crate::mapdata::LabelKind::Park => 3,
-            crate::mapdata::LabelKind::Building => 4,
-            crate::mapdata::LabelKind::Poi => 5,
+            crate::mapdata::LabelKind::State => 0,
+            crate::mapdata::LabelKind::City => 1,
+            crate::mapdata::LabelKind::Subdivision => 2,
+            crate::mapdata::LabelKind::Listing => 3,
+            crate::mapdata::LabelKind::Park => 4,
+            crate::mapdata::LabelKind::Street => 5,
+            crate::mapdata::LabelKind::Poi => 6,
+            crate::mapdata::LabelKind::Building => 7,
         });
 
         for label in &sorted_labels {
@@ -318,7 +324,9 @@ impl TextSystem {
 
             // Filter labels by zoom level
             let min_zoom = match label.kind {
+                crate::mapdata::LabelKind::State => -10.0,
                 crate::mapdata::LabelKind::City => -10.0,
+                crate::mapdata::LabelKind::Subdivision => -4.0,
                 crate::mapdata::LabelKind::Listing => -10.0,
                 crate::mapdata::LabelKind::Park => -2.0,
                 crate::mapdata::LabelKind::Street => -10.0,
@@ -330,40 +338,8 @@ impl TextSystem {
             }
 
             let is_listing = matches!(label.kind, crate::mapdata::LabelKind::Listing);
-            let is_street = matches!(label.kind, crate::mapdata::LabelKind::Street);
-            let is_poi = matches!(label.kind, crate::mapdata::LabelKind::Poi);
-
-            // Each label type gets its own grid cell size and collision grid
-            let cell = if is_street {
-                grid_cell * 0.3
-            } else if is_poi {
-                grid_cell * 0.25
-            } else {
-                grid_cell
-            };
-            let gx = (label.position[0] / cell).floor() as i32;
-            let gy = (label.position[1] / cell).floor() as i32;
-
-            let grid = if is_street {
-                &mut grid_streets
-            } else if is_poi {
-                &mut grid_pois
-            } else {
-                &mut grid_main
-            };
-
-            if !is_listing {
-                let occupied = (-1..=1).any(|dx| {
-                    (-1..=1).any(|dy| grid.contains(&(gx + dx, gy + dy)))
-                });
-                if occupied {
-                    continue;
-                }
-            }
-            grid.insert((gx, gy));
-            label_count += 1;
-
             let scale = label.font_scale();
+            let spacing = label.letter_spacing();
 
             let (label_text_color, label_halo_color) = match label.kind {
                 crate::mapdata::LabelKind::Listing => {
@@ -378,12 +354,38 @@ impl TextSystem {
                 }
                 _ => (text_color, halo_color),
             };
-            // Measure total width for centering (with per-label letter spacing)
-            let spacing = label.letter_spacing();
+
+            // Measure total width for centering and collision bounds
             let total_width: f32 = label.text.chars()
                 .filter_map(|c| self.get_glyph(c))
                 .map(|g| g.advance * scale * spacing)
                 .sum();
+
+            // World-space AABB based on actual rendered label extent.
+            // Small inflation hides hairline edge-touching at the pixel level.
+            let half_w_world = total_width * 0.5 * world_per_px * 1.05;
+            let half_h_world = self.font_size * scale * 0.5 * world_per_px * 1.5;
+            let my_aabb = LabelAabb {
+                min_x: label.position[0] - half_w_world,
+                max_x: label.position[0] + half_w_world,
+                min_y: label.position[1] - half_h_world,
+                max_y: label.position[1] + half_h_world,
+            };
+
+            // Listings (user's own homes) always render — they're the primary overlay.
+            if !is_listing {
+                let overlaps = accepted.iter().any(|a| {
+                    !(my_aabb.max_x < a.min_x
+                        || my_aabb.min_x > a.max_x
+                        || my_aabb.max_y < a.min_y
+                        || my_aabb.min_y > a.max_y)
+                });
+                if overlaps {
+                    continue;
+                }
+            }
+            accepted.push(my_aabb);
+            label_count += 1;
 
             // Curved road labels: place each glyph at its own world position along the path
             if let Some(ref path) = label.path {

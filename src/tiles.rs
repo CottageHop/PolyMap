@@ -1,24 +1,62 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::gpu::GpuState;
 use crate::mapdata::{self, MapData, MapVertex, Label};
 use crate::mvt_convert::DetailLevel;
 
+/// LRU-tracked cache. The companion VecDeque stores keys in insertion/access
+/// order so eviction on capacity overflow drops the single oldest entry
+/// instead of wiping the whole map (which caused frame stutter on pan).
+#[cfg(target_arch = "wasm32")]
+struct LruCache<K: Eq + std::hash::Hash + Clone, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+    cap: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    }
+    fn get(&self, key: &K) -> Option<&V> { self.map.get(key) }
+    fn insert(&mut self, key: K, value: V) {
+        if !self.map.contains_key(&key) {
+            if self.map.len() >= self.cap {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.map.insert(key, value);
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static CURRENT_DETAIL: std::cell::Cell<DetailLevel> = std::cell::Cell::new(DetailLevel::High);
     /// Cache of generated MapData by (z14 tile x, y, detail level).
     /// Uses Rc to avoid cloning multi-MB vertex arrays on cache hit.
-    static MAPDATA_CACHE: std::cell::RefCell<HashMap<(u32, u32, u8), Rc<MapData>>> =
-        std::cell::RefCell::new(HashMap::new());
+    /// LRU eviction at cap to avoid the frame-stutter sawtooth a full-clear would cause.
+    static MAPDATA_CACHE: std::cell::RefCell<LruCache<(u32, u32, u8), Rc<MapData>>> =
+        std::cell::RefCell::new(LruCache::new(64));
     /// Tracks which z14 tiles already have geometry rendered.
     static RENDERED_Z14: std::cell::RefCell<std::collections::HashSet<(u32, u32)>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Determine detail level from camera zoom.
-/// Always High — show everything at every zoom level.
+/// Currently always High — the detail-level gating in mvt_convert.rs only
+/// touches POIs and road outlines, so switching tiers triggers a full
+/// MAPDATA_CACHE wipe + tile re-fetch for essentially zero geometry savings.
+/// Re-introduce zoom-based LOD once more mvt_convert paths gate walls,
+/// shadows, and trees by detail level.
 pub fn detail_for_zoom(_zoom: f32) -> DetailLevel {
     DetailLevel::High
 }
@@ -95,6 +133,7 @@ pub struct LoadedTile {
     pub shadow_index_buffer: Option<wgpu::Buffer>,
     pub num_shadow_indices: u32,
     pub labels: Vec<Label>,
+    pub cars: Vec<crate::mapdata::Car>,
     pub last_visible_frame: u64,
     /// z14 MVT tile coordinates — used for dedup in rendering
     pub z14_tile: (u32, u32),
@@ -125,6 +164,7 @@ impl LoadedTile {
             shadow_index_buffer: shadow_ib,
             num_shadow_indices: num_shadow,
             labels: data.labels.clone(),
+            cars: data.cars.clone(),
             last_visible_frame: 0,
             z14_tile,
         }
@@ -527,6 +567,36 @@ impl TileManager {
     }
 
     /// Get all loaded tiles for rendering.
+    /// Loaded tiles whose projected world AABB intersects the given camera AABB.
+    /// Culls cache entries that are loaded but off-screen, so the renderer
+    /// never submits geometry for them.
+    pub fn loaded_tiles_in_aabb(
+        &self,
+        cam_aabb: (f32, f32, f32, f32),
+    ) -> impl Iterator<Item = &LoadedTile> {
+        let (cmin_x, cmin_y, cmax_x, cmax_y) = cam_aabb;
+        let center_lat = self.center_lat;
+        let center_lon = self.center_lon;
+        self.tiles.iter().filter_map(move |(coord, state)| {
+            let tile = match state {
+                TileState::Loaded(t) | TileState::Stale(t) => t,
+                _ => return None,
+            };
+            let (s, w, n, e) = coord.bbox();
+            // Project the four corners of the tile's lat/lon bbox to world.
+            let sw = crate::mapdata::project_pub(s, w, center_lat, center_lon);
+            let ne = crate::mapdata::project_pub(n, e, center_lat, center_lon);
+            let tile_min_x = sw[0].min(ne[0]);
+            let tile_max_x = sw[0].max(ne[0]);
+            let tile_min_y = sw[1].min(ne[1]);
+            let tile_max_y = sw[1].max(ne[1]);
+            // AABB intersection test
+            if tile_max_x < cmin_x || tile_min_x > cmax_x { return None; }
+            if tile_max_y < cmin_y || tile_min_y > cmax_y { return None; }
+            Some(tile)
+        })
+    }
+
     pub fn loaded_tiles(&self) -> impl Iterator<Item = &LoadedTile> {
         self.tiles.values().filter_map(|state| {
             match state {
@@ -593,12 +663,14 @@ fn latlon_to_zxy(lat: f64, lon: f64, z: u8) -> (u32, u32) {
 // ── z14 MVT raw bytes cache ──────────────────────────────────────
 // Multiple 0.01° PolyMap tiles map to the same z14 MVT tile (~0.022°).
 // Cache raw decompressed bytes to avoid redundant HTTP fetches.
+// LRU eviction so overflow drops one entry rather than stalling the
+// frame with a catastrophic full-cache deallocation.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static MVT_BYTES_CACHE: std::cell::RefCell<HashMap<(u32, u32), Rc<Vec<u8>>>> =
-        std::cell::RefCell::new(HashMap::new());
-    static PARCEL_BYTES_CACHE: std::cell::RefCell<HashMap<(u32, u32), Rc<Vec<u8>>>> =
-        std::cell::RefCell::new(HashMap::new());
+    static MVT_BYTES_CACHE: std::cell::RefCell<LruCache<(u32, u32), Rc<Vec<u8>>>> =
+        std::cell::RefCell::new(LruCache::new(32));
+    static PARCEL_BYTES_CACHE: std::cell::RefCell<LruCache<(u32, u32), Rc<Vec<u8>>>> =
+        std::cell::RefCell::new(LruCache::new(64));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -614,9 +686,7 @@ async fn get_or_fetch_mvt_bytes(url: &str, z: u8, tx: u32, ty: u32) -> Result<Rc
 
     let rc_data = Rc::new(tile_data);
     MVT_BYTES_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() > 32 { cache.clear(); }
-        cache.insert((tx, ty), Rc::clone(&rc_data));
+        c.borrow_mut().insert((tx, ty), Rc::clone(&rc_data));
     });
 
     Ok(rc_data)
@@ -636,9 +706,7 @@ async fn get_or_fetch_parcel_bytes(url: &str, z: u8, tx: u32, ty: u32) -> Result
 
     let rc_data = Rc::new(tile_data);
     PARCEL_BYTES_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() > 64 { cache.clear(); }
-        cache.insert((tx, ty), Rc::clone(&rc_data));
+        c.borrow_mut().insert((tx, ty), Rc::clone(&rc_data));
     });
 
     Ok(rc_data)
@@ -683,11 +751,10 @@ async fn fetch_tile_wasm(
             // Parcel overlay disabled
 
             let rc_data = Rc::new(data);
-            // Cache for other PolyMap tiles sharing this z14 tile
+            // Cache for other PolyMap tiles sharing this z14 tile.
+            // LRU eviction in insert() drops only the oldest entry on overflow.
             MAPDATA_CACHE.with(|c| {
-                let mut cache = c.borrow_mut();
-                if cache.len() > 64 { cache.clear(); }
-                cache.insert((tx, ty, detail_key), Rc::clone(&rc_data));
+                c.borrow_mut().insert((tx, ty, detail_key), Rc::clone(&rc_data));
             });
 
             rc_data
