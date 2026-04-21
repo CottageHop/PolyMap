@@ -12,7 +12,7 @@ use crate::mapdata::{
     triangulate_polygon_at_height, Label, LabelKind, MapData, MapVertex, RoadType,
     COLOR_BUILDING, COLOR_COMMERCIAL, COLOR_INDUSTRIAL, COLOR_LAND,
     COLOR_PARK, COLOR_RESIDENTIAL, COLOR_ROAD_MAJOR, COLOR_ROAD_MINOR,
-    COLOR_RAIL, COLOR_ROAD_OUTLINE, COLOR_SHADOW_CORE, COLOR_SHADOW_EDGE, COLOR_SHADOW_MID, COLOR_SIDEWALK,
+    COLOR_RAIL, COLOR_RAIL_TIE, COLOR_ROAD_OUTLINE, COLOR_SHADOW_CORE, COLOR_SHADOW_EDGE, COLOR_SHADOW_MID, COLOR_SIDEWALK,
     COLOR_SIDEWALK_OUTLINE, COLOR_SKYSCRAPER, COLOR_WATER, MAT_BUILDING, MAT_BUILDING_WALL,
     MAT_COBBLESTONE, MAT_COMMERCIAL, MAT_DEFAULT, MAT_GLASS, MAT_GLASS_WALL, MAT_GRASS,
     MAT_INDUSTRIAL, MAT_RESIDENTIAL, MAT_ROAD, MAT_WATER,
@@ -474,6 +474,48 @@ pub fn mvt_to_mapdata(
         );
         for v in &mut vertices[start_vert..] {
             v.position[2] = Z_ROAD_FILL;
+        }
+
+        // Railroad crossties — perpendicular bars along the rail path so
+        // tracks read distinctly from ordinary roads.
+        if matches!(road_type, RoadType::Rail) && coords.len() >= 2 {
+            const TIE_SPACING: f32 = 2.0;  // world units between tie centers
+            const TIE_HALF_WIDTH: f32 = 0.4;  // perpendicular to rail (total width 0.8)
+            const TIE_HALF_LEN: f32 = 0.25;   // along rail direction (total 0.5)
+            let tie_z = Z_ROAD_FILL + 0.0005;
+
+            let mut walked = 0.0f32;
+            let mut next_tie = TIE_SPACING * 0.5;
+            for i in 0..coords.len() - 1 {
+                let dx = coords[i + 1][0] - coords[i][0];
+                let dy = coords[i + 1][1] - coords[i][1];
+                let seg_len = (dx * dx + dy * dy).sqrt();
+                if seg_len < 1e-6 { continue; }
+                let ux = dx / seg_len;
+                let uy = dy / seg_len;
+                let px = -uy; // perpendicular in 2D
+                let py = ux;
+
+                while walked + seg_len >= next_tie {
+                    let t_local = next_tie - walked;
+                    let cx = coords[i][0] + ux * t_local;
+                    let cy = coords[i][1] + uy * t_local;
+                    let hl = TIE_HALF_LEN;
+                    let hw = TIE_HALF_WIDTH;
+                    let v0 = [cx - ux * hl - px * hw, cy - uy * hl - py * hw];
+                    let v1 = [cx + ux * hl - px * hw, cy + uy * hl - py * hw];
+                    let v2 = [cx - ux * hl + px * hw, cy - uy * hl + py * hw];
+                    let v3 = [cx + ux * hl + px * hw, cy + uy * hl + py * hw];
+                    let base = vertices.len() as u32;
+                    vertices.push(MapVertex::at_height(v0[0], v0[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
+                    vertices.push(MapVertex::at_height(v1[0], v1[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
+                    vertices.push(MapVertex::at_height(v2[0], v2[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
+                    vertices.push(MapVertex::at_height(v3[0], v3[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
+                    indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+                    next_tie += TIE_SPACING;
+                }
+                walked += seg_len;
+            }
         }
     }
 

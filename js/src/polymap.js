@@ -5,6 +5,29 @@
 
 let wasmModule = null;
 
+// ── Theme definitions ─────────────────────────────────────────────
+// Shared between the control panel and the public PolyMapInstance.applyTheme()
+// so external callers can set a theme without the control panel being mounted.
+const SRGB_TO_LINEAR = (c) =>
+  c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+const HEX_TO_RGBA = (hex) => {
+  const r = SRGB_TO_LINEAR(parseInt(hex.slice(1, 3), 16) / 255);
+  const g = SRGB_TO_LINEAR(parseInt(hex.slice(3, 5), 16) / 255);
+  const b = SRGB_TO_LINEAR(parseInt(hex.slice(5, 7), 16) / 255);
+  return [r, g, b, 1.0];
+};
+export const THEMES = {
+  cottagecore:     { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
+  cottagecoredark: { water:'#4a7fb0', park:'#3e6b28', building:'#d9b08f', road:'#9a9a9a', land:'#1a2e1a', marker:'#c0392b', cloudOpacity:2,  clouds:true },
+  cyberpunk:       { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0,  clouds:false },
+  modern:          { water:'#42a5f5', park:'#8bc34a', building:'#e0e0e0', road:'#bdbdbd', land:'#f5f5f5', marker:'#1976d2', cloudOpacity:30, clouds:true },
+  greyscale:       { water:'#888888', park:'#aaaaaa', building:'#666666', road:'#777777', land:'#f0f0f0', marker:'#444444', cloudOpacity:20, clouds:true },
+  dark:            { water:'#1a3a4a', park:'#1e3a1e', building:'#2a2a2a', road:'#5a5a5a', land:'#1a1a1a', marker:'#e0e0e0', cloudOpacity:15, clouds:true },
+  eighties:        { water:'#0099dd', park:'#7bef2a', building:'#e5573e', road:'#ff1493', land:'#ffd732', marker:'#0099dd', cloudOpacity:0,  clouds:false },
+  seventies:       { water:'#4ca8a8', park:'#f7c868', building:'#e87848', road:'#e03030', land:'#fdd998', marker:'#e03030', cloudOpacity:0,  clouds:false },
+  oldworld:        { water:'#5b7e8a', park:'#6b7c47', building:'#c4a265', road:'#8b4513', land:'#e8d5a3', marker:'#8b0000', cloudOpacity:0,  clouds:false },
+};
+
 /** Create a canvas for pixel manipulation (Safari fallback for OffscreenCanvas). */
 function createPixelCanvas(w, h) {
   if (typeof OffscreenCanvas !== 'undefined') {
@@ -476,6 +499,34 @@ class PolyMapInstance {
     if (this._controls) this._controls.style.display = 'none';
   }
 
+  /**
+   * Apply one of the built-in theme presets by name. Drives colors, cloud
+   * opacity/visibility, and the marker accent CSS variable — same effect as
+   * clicking the theme button in the control panel.
+   * @param {keyof typeof THEMES | string} name
+   */
+  applyTheme(name) {
+    const t = THEMES[name];
+    if (!t) return this;
+    if (t.useDefaults) {
+      this.setColors({ water: [0,0,0,0], park: [0,0,0,0], building: [0,0,0,0], road: [0,0,0,0], land: [0,0,0,0] });
+    } else {
+      this.setColors({
+        water: HEX_TO_RGBA(t.water),
+        park: HEX_TO_RGBA(t.park),
+        building: HEX_TO_RGBA(t.building),
+        road: HEX_TO_RGBA(t.road),
+        land: HEX_TO_RGBA(t.land),
+      });
+    }
+    this.setCloudOpacity(t.cloudOpacity / 100);
+    this.setLayerVisible('clouds', t.clouds);
+    if (t.marker && typeof document !== 'undefined') {
+      document.documentElement.style.setProperty('--marker-color', t.marker);
+    }
+    return this;
+  }
+
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
@@ -519,42 +570,16 @@ class PolyMapInstance {
  * @returns {HTMLElement}
  */
 function createControlsPanel(container, map) {
-  const srgbToLinear = (c) =>
-    c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  const hexToRgba = (hex) => {
-    const r = srgbToLinear(parseInt(hex.slice(1, 3), 16) / 255);
-    const g = srgbToLinear(parseInt(hex.slice(3, 5), 16) / 255);
-    const b = srgbToLinear(parseInt(hex.slice(5, 7), 16) / 255);
-    return [r, g, b, 1.0];
-  };
-
-  const THEMES = {
-    cottagecore:     { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
-    cottagecoredark: { water:'#4a7fb0', park:'#3e6b28', building:'#d9b08f', road:'#9a9a9a', land:'#1a2e1a', marker:'#c0392b', cloudOpacity:10, clouds:true },
-    cyberpunk:       { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0, clouds:false },
-    modern:      { water:'#42a5f5', park:'#8bc34a', building:'#e0e0e0', road:'#bdbdbd', land:'#f5f5f5', marker:'#1976d2', cloudOpacity:30, clouds:true },
-    greyscale:   { water:'#888888', park:'#aaaaaa', building:'#666666', road:'#777777', land:'#f0f0f0', marker:'#444444', cloudOpacity:20, clouds:true },
-    dark:        { water:'#1a3a4a', park:'#1e3a1e', building:'#2a2a2a', road:'#5a5a5a', land:'#1a1a1a', marker:'#e0e0e0', cloudOpacity:15, clouds:true },
-    eighties:    { water:'#0099dd', park:'#7bef2a', building:'#e5573e', road:'#ff1493', land:'#ffd732', marker:'#0099dd', cloudOpacity:0, clouds:false },
-    seventies:   { water:'#4ca8a8', park:'#f7c868', building:'#e87848', road:'#e03030', land:'#fdd998', marker:'#e03030', cloudOpacity:0, clouds:false },
-    oldworld:    { water:'#5b7e8a', park:'#6b7c47', building:'#c4a265', road:'#8b4513', land:'#e8d5a3', marker:'#8b0000', cloudOpacity:0, clouds:false },
-  };
-
   function applyTheme(name) {
     const t = THEMES[name];
     if (!t) return;
+    // Apply colors + clouds via the shared instance method.
+    map.applyTheme(name);
+    // Sync panel UI to reflect the new theme.
     for (const [key, id] of [['water','ctrl-water'],['park','ctrl-park'],['building','ctrl-building'],['road','ctrl-road'],['land','ctrl-land'],['marker','ctrl-marker']]) {
       const el = panel.querySelector('#' + id);
       if (el) el.value = t[key];
     }
-    panel.querySelector('#ctrl-marker')?.dispatchEvent(new Event('input'));
-    if (t.useDefaults) {
-      map.setColors({ water:[0,0,0,0], park:[0,0,0,0], building:[0,0,0,0], road:[0,0,0,0], land:[0,0,0,0] });
-    } else {
-      map.setColors({ water:hexToRgba(t.water), park:hexToRgba(t.park), building:hexToRgba(t.building), road:hexToRgba(t.road), land:hexToRgba(t.land) });
-    }
-    map.setCloudOpacity(t.cloudOpacity / 100);
-    map.setLayerVisible('clouds', t.clouds);
     const opSlider = panel.querySelector('#ctrl-opacity');
     const opVal = panel.querySelector('#ctrl-opacity-val');
     if (opSlider) opSlider.value = t.cloudOpacity;

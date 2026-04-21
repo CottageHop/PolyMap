@@ -101,7 +101,7 @@ impl Camera {
     /// The world point under `screen_pos` stays fixed after zooming.
     pub fn zoom_at(&mut self, delta: f32, screen_pos: Vec2) {
         let old_zoom = self.target_zoom;
-        let new_zoom = (old_zoom + delta).clamp(-2.0, 2.5);
+        let new_zoom = (old_zoom + delta).clamp(-3.5, 2.5);
         if (new_zoom - old_zoom).abs() < 1e-6 {
             return;
         }
@@ -250,7 +250,7 @@ impl Camera {
 
     /// Set the target zoom for smooth zooming.
     pub fn set_target_zoom(&mut self, zoom: f32) {
-        self.target_zoom = zoom.clamp(-2.0, 2.5);
+        self.target_zoom = zoom.clamp(-3.5, 2.5);
         self.dirty = true;
     }
 
