@@ -391,7 +391,11 @@ impl TileManager {
     fn record_failure(&mut self, coord: TileCoord) {
         let retries = self.fail_counts.entry(coord).or_insert(0);
         *retries += 1;
-        let backoff = FAIL_BACKOFF_BASE_SECS * 2.0_f64.powi((*retries - 1) as i32);
+        // Cap the exponent so repeated failures after eviction-then-revisit
+        // don't produce `inf` and panic `Duration::from_secs_f64`. Capping at
+        // 20 gives a maximum backoff of ~24 days, plenty.
+        let exp = ((*retries as i64 - 1).clamp(0, 20)) as i32;
+        let backoff = FAIL_BACKOFF_BASE_SECS * 2.0_f64.powi(exp);
         self.tiles.insert(coord, TileState::Failed(
             web_time::Instant::now() + std::time::Duration::from_secs_f64(backoff),
         ));
@@ -563,6 +567,11 @@ impl TileManager {
 
             if let Some((coord, _)) = oldest {
                 self.tiles.remove(&coord);
+                // Don't leak the retry counter — if the tile comes back into
+                // view later we want a fresh budget, not to resume from an old
+                // accumulated count (which could eventually overflow the
+                // backoff exponent).
+                self.fail_counts.remove(&coord);
                 evicted += 1;
             } else {
                 break; // all remaining tiles are currently visible — can't evict
