@@ -443,7 +443,7 @@ pub fn mvt_to_mapdata(
         if matches!(road_type, RoadType::Path | RoadType::Rail) {
             continue;
         }
-        let width = road_width(road_type) + 0.05;
+        let width = road_width(road_type) + 0.20;
         let start_vert = vertices.len();
         generate_line_geometry(
             coords, width, COLOR_ROAD_OUTLINE, MAT_ROAD,

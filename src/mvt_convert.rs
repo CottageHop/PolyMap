@@ -437,13 +437,15 @@ pub fn mvt_to_mapdata(
     }
     } // end Medium+ sidewalk block
 
-    // Layer 6: Road outlines (slightly wider, dark) — Medium+ detail
+    // Layer 6: Road outlines — widened so the exposed beige margin reads as
+    // a curb/sidewalk strip on each side of the asphalt. The darker road
+    // fill (below) is now the "between-sidewalks" width.
     if detail >= DetailLevel::Medium {
     for (coords, road_type, _) in &road_lines {
         if matches!(road_type, RoadType::Path | RoadType::Rail) {
             continue;
         }
-        let width = road_width(road_type) + 0.05;
+        let width = road_width(road_type) + 0.20;
         let start_vert = vertices.len();
         generate_line_geometry(
             coords, width, COLOR_ROAD_OUTLINE, MAT_ROAD,
