@@ -319,6 +319,11 @@ impl App {
                                 }
                             };
 
+                            // MapVertex stride in f32s: [f32;3] + [f32;4] + f32 = 8
+                            const VERT_STRIDE_F32S: usize = 8;
+                            let num_verts = vertices.len() / VERT_STRIDE_F32S;
+                            let num_shadow_verts = shadow_vertices.len() / VERT_STRIDE_F32S;
+
                             // Create vertex/index buffers from raw f32/u32 data
                             let vertex_buffer = crate::gpu::safe_buffer(
                                 &gpu.device, &gpu.queue, "Worker Tile Vertex Buffer",
@@ -330,19 +335,32 @@ impl App {
                             );
                             let num_indices = indices.len() as u32;
 
+                            // Parallel birth-time buffer for tile fade-in.
+                            let now_secs = (Instant::now() - self.start_time).as_secs_f32();
+                            let birth_data: Vec<f32> = vec![now_secs; num_verts.max(1)];
+                            let birth_buffer = crate::gpu::safe_buffer(
+                                &gpu.device, &gpu.queue, "Worker Tile Birth VB",
+                                bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX,
+                            );
+
                             // Shadow buffers (optional)
-                            let (shadow_vb, shadow_ib, num_shadow) = if !shadow_vertices.is_empty() {
+                            let (shadow_vb, shadow_bb, shadow_ib, num_shadow) = if !shadow_vertices.is_empty() {
                                 let svb = crate::gpu::safe_buffer(
                                     &gpu.device, &gpu.queue, "Worker Tile Shadow Vertex Buffer",
                                     bytemuck::cast_slice(&shadow_vertices), wgpu::BufferUsages::VERTEX,
+                                );
+                                let shadow_birth: Vec<f32> = vec![now_secs; num_shadow_verts.max(1)];
+                                let sbb = crate::gpu::safe_buffer(
+                                    &gpu.device, &gpu.queue, "Worker Tile Shadow Birth VB",
+                                    bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX,
                                 );
                                 let sib = crate::gpu::safe_buffer(
                                     &gpu.device, &gpu.queue, "Worker Tile Shadow Index Buffer",
                                     bytemuck::cast_slice(&shadow_indices), wgpu::BufferUsages::INDEX,
                                 );
-                                (Some(svb), Some(sib), shadow_indices.len() as u32)
+                                (Some(svb), Some(sbb), Some(sib), shadow_indices.len() as u32)
                             } else {
-                                (None, None, 0)
+                                (None, None, None, 0)
                             };
 
                             // Parse labels from JSON
@@ -357,9 +375,11 @@ impl App {
 
                             let loaded = tiles::LoadedTile {
                                 vertex_buffer,
+                                birth_buffer,
                                 index_buffer,
                                 num_indices,
                                 shadow_vertex_buffer: shadow_vb,
+                                shadow_birth_buffer: shadow_bb,
                                 shadow_index_buffer: shadow_ib,
                                 num_shadow_indices: num_shadow,
                                 labels,
@@ -741,7 +761,7 @@ impl ApplicationHandler for App {
 
                     if let (Some(gpu), Some(tm)) = (&self.gpu, &mut self.tile_manager) {
                         // Always poll for completed tiles (cheap — just checks a channel)
-                        tm.poll_completed(gpu);
+                        tm.poll_completed(gpu, elapsed);
 
                         // Expensive tile work (visibility calc, requests, eviction):
                         // Run every 10th frame to keep panning smooth, but always on first 3 frames
@@ -1004,7 +1024,7 @@ impl App {
                 self.tile_manager = Some(tiles::TileManager::new(clat, clon));
             }
             if let (Some(gpu), Some(tm)) = (&self.gpu, &mut self.tile_manager) {
-                tm.poll_completed(gpu);
+                tm.poll_completed(gpu, elapsed);
                 let frame = tm.frame_counter;
                 tm.frame_counter += 1;
                 if frame % 10 == 0 || frame < 3 {

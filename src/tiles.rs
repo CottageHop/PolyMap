@@ -127,9 +127,15 @@ pub enum TileState {
 
 pub struct LoadedTile {
     pub vertex_buffer: wgpu::Buffer,
+    /// Parallel vertex buffer holding `birth_time: f32` per vertex — the tile's
+    /// upload time (seconds since app start). Shader compares to camera.time
+    /// to fade the tile in smoothly on load. Matches the vertex count of
+    /// `vertex_buffer`.
+    pub birth_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
     pub shadow_vertex_buffer: Option<wgpu::Buffer>,
+    pub shadow_birth_buffer: Option<wgpu::Buffer>,
     pub shadow_index_buffer: Option<wgpu::Buffer>,
     pub num_shadow_indices: u32,
     pub labels: Vec<Label>,
@@ -140,27 +146,39 @@ pub struct LoadedTile {
 }
 
 impl LoadedTile {
-    pub fn from_map_data(gpu: &GpuState, data: &MapData, z14_tile: (u32, u32)) -> Self {
+    pub fn from_map_data(gpu: &GpuState, data: &MapData, z14_tile: (u32, u32), birth_time: f32) -> Self {
         let vertex_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile VB",
             bytemuck::cast_slice(&data.vertices), wgpu::BufferUsages::VERTEX);
         let index_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile IB",
             bytemuck::cast_slice(&data.indices), wgpu::BufferUsages::INDEX);
 
-        let (shadow_vb, shadow_ib, num_shadow) = if !data.shadow_vertices.is_empty() {
+        // Parallel birth-time buffer: one f32 per vertex, all the same value.
+        // Keeps the main vertex layout binary-compatible with polymap-worker
+        // while letting the shader fade the tile in on load.
+        let birth_data: Vec<f32> = vec![birth_time; data.vertices.len().max(1)];
+        let birth_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile Birth VB",
+            bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX);
+
+        let (shadow_vb, shadow_bb, shadow_ib, num_shadow) = if !data.shadow_vertices.is_empty() {
             let svb = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile SVB",
                 bytemuck::cast_slice(&data.shadow_vertices), wgpu::BufferUsages::VERTEX);
+            let shadow_birth: Vec<f32> = vec![birth_time; data.shadow_vertices.len()];
+            let sbb = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile Shadow Birth VB",
+                bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX);
             let sib = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile SIB",
                 bytemuck::cast_slice(&data.shadow_indices), wgpu::BufferUsages::INDEX);
-            (Some(svb), Some(sib), data.shadow_indices.len() as u32)
+            (Some(svb), Some(sbb), Some(sib), data.shadow_indices.len() as u32)
         } else {
-            (None, None, 0)
+            (None, None, None, 0)
         };
 
         Self {
             vertex_buffer,
+            birth_buffer,
             index_buffer,
             num_indices: data.indices.len() as u32,
             shadow_vertex_buffer: shadow_vb,
+            shadow_birth_buffer: shadow_bb,
             shadow_index_buffer: shadow_ib,
             num_shadow_indices: num_shadow,
             labels: data.labels.clone(),
@@ -434,7 +452,9 @@ impl TileManager {
     }
 
     /// Poll for completed tile fetches and upload to GPU.
-    pub fn poll_completed(&mut self, gpu: &GpuState) {
+    /// `now_secs` is seconds since app start; stamped into each tile's
+    /// vertex data so the map shader can fade the tile in on load.
+    pub fn poll_completed(&mut self, gpu: &GpuState, now_secs: f32) {
         self.tiles_changed = false;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -449,7 +469,7 @@ impl TileManager {
                             let mid_lat = (s + n) / 2.0;
                             let mid_lon = (w + e) / 2.0;
                             let (tx, ty) = latlon_to_zxy(mid_lat, mid_lon, 14);
-                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty));
+                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty), now_secs);
                             self.fail_counts.remove(&coord);
                             self.tiles.insert(coord, TileState::Loaded(loaded));
                         } else {
@@ -485,7 +505,7 @@ impl TileManager {
                             let mid_lat = (s + n) / 2.0;
                             let mid_lon = (w + e) / 2.0;
                             let (tx, ty) = latlon_to_zxy(mid_lat, mid_lon, 14);
-                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty));
+                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty), now_secs);
                             self.fail_counts.remove(&coord);
                             self.tiles.insert(coord, TileState::Loaded(loaded));
                         } else {

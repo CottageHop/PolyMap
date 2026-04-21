@@ -43,6 +43,9 @@ const FOUNTAIN_MAX_AREA: f32 = 0.15;
 const FOUNTAIN_MIN_CIRCULARITY: f32 = 0.65;
 
 /// A single vertex for the map geometry, sent directly to the GPU.
+/// IMPORTANT: this layout must match `polymap-worker`'s MapVertex exactly.
+/// Per-tile data that varies per-frame (fade-in birth time, etc.) lives in
+/// a parallel vertex buffer owned by the main thread, not here.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MapVertex {

@@ -10,9 +10,14 @@ pub struct Renderer {
     shadow_pipeline: wgpu::RenderPipeline,
     cloud_pipeline: wgpu::RenderPipeline,
     vertex_buffer: Option<wgpu::Buffer>,
+    /// Parallel birth-time VB for the non-tile render() path. Pipeline requires
+    /// a second vertex buffer slot even for the single-shot MapData case; fill
+    /// with zeros (= fully faded-in).
+    birth_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     num_indices: u32,
     shadow_vertex_buffer: Option<wgpu::Buffer>,
+    shadow_birth_buffer: Option<wgpu::Buffer>,
     shadow_index_buffer: Option<wgpu::Buffer>,
     num_shadow_indices: u32,
     pub text: TextSystem,
@@ -69,6 +74,20 @@ impl Renderer {
                 },
             ],
         };
+        // Parallel vertex buffer carrying each vertex's tile birth-time (in
+        // seconds since app start). One f32 per vertex. Used by the map and
+        // shadow pipelines to fade the tile in on load.
+        let birth_layout = wgpu::VertexBufferLayout {
+            array_stride: 4 as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32,
+                },
+            ],
+        };
 
         let map_pipeline =
             gpu.device
@@ -78,7 +97,7 @@ impl Renderer {
                     vertex: wgpu::VertexState {
                         module: &map_shader,
                         entry_point: Some("vs_main"),
-                        buffers: &[vertex_layout.clone()],
+                        buffers: &[vertex_layout.clone(), birth_layout.clone()],
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -125,7 +144,7 @@ impl Renderer {
                     vertex: wgpu::VertexState {
                         module: &map_shader,
                         entry_point: Some("vs_main"),
-                        buffers: &[vertex_layout],
+                        buffers: &[vertex_layout, birth_layout],
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -233,9 +252,11 @@ impl Renderer {
             shadow_pipeline,
             cloud_pipeline,
             vertex_buffer: None,
+            birth_buffer: None,
             index_buffer: None,
             num_indices: 0,
             shadow_vertex_buffer: None,
+            shadow_birth_buffer: None,
             shadow_index_buffer: None,
             num_shadow_indices: 0,
             text,
@@ -254,6 +275,14 @@ impl Renderer {
             bytemuck::cast_slice(&data.vertices), wgpu::BufferUsages::VERTEX,
         ));
 
+        // Stub birth-time VB — 0.0 means "already fully faded in" since this
+        // path is the single-shot native/pre-loaded case.
+        let birth_data: Vec<f32> = vec![0.0; data.vertices.len().max(1)];
+        self.birth_buffer = Some(crate::gpu::safe_buffer(
+            &gpu.device, &gpu.queue, "Map Birth Buffer",
+            bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX,
+        ));
+
         self.index_buffer = Some(crate::gpu::safe_buffer(
             &gpu.device, &gpu.queue, "Map Index Buffer",
             bytemuck::cast_slice(&data.indices), wgpu::BufferUsages::INDEX,
@@ -265,6 +294,12 @@ impl Renderer {
             self.shadow_vertex_buffer = Some(crate::gpu::safe_buffer(
                 &gpu.device, &gpu.queue, "Shadow Vertex Buffer",
                 bytemuck::cast_slice(&data.shadow_vertices), wgpu::BufferUsages::VERTEX,
+            ));
+
+            let shadow_birth: Vec<f32> = vec![0.0; data.shadow_vertices.len()];
+            self.shadow_birth_buffer = Some(crate::gpu::safe_buffer(
+                &gpu.device, &gpu.queue, "Shadow Birth Buffer",
+                bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX,
             ));
 
             self.shadow_index_buffer = Some(crate::gpu::safe_buffer(
@@ -341,11 +376,12 @@ impl Renderer {
 
             // Pass 1: Map geometry (opaque)
             if self.num_indices > 0 {
-                if let (Some(vb), Some(ib)) = (&self.vertex_buffer, &self.index_buffer) {
+                if let (Some(vb), Some(bb), Some(ib)) = (&self.vertex_buffer, &self.birth_buffer, &self.index_buffer) {
                     render_pass.set_pipeline(&self.map_pipeline);
                     render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
                     render_pass.set_bind_group(1, self.textures.material_bind_group().unwrap(), &[]);
                     render_pass.set_vertex_buffer(0, vb.slice(..));
+                    render_pass.set_vertex_buffer(1, bb.slice(..));
                     render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
                 }
@@ -353,11 +389,12 @@ impl Renderer {
 
             // Pass 2: Shadows
             if layers.shadows && self.num_shadow_indices > 0 {
-                if let (Some(vb), Some(ib)) = (&self.shadow_vertex_buffer, &self.shadow_index_buffer) {
+                if let (Some(vb), Some(bb), Some(ib)) = (&self.shadow_vertex_buffer, &self.shadow_birth_buffer, &self.shadow_index_buffer) {
                     render_pass.set_pipeline(&self.shadow_pipeline);
                     render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
                     render_pass.set_bind_group(1, self.textures.material_bind_group().unwrap(), &[]);
                     render_pass.set_vertex_buffer(0, vb.slice(..));
+                    render_pass.set_vertex_buffer(1, bb.slice(..));
                     render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                     render_pass.draw_indexed(0..self.num_shadow_indices, 0, 0..1);
                 }
@@ -446,12 +483,13 @@ impl Renderer {
                 v
             };
 
-            // Pass 1: Opaque geometry
+            // Pass 1: Opaque geometry (slot 0 = geometry VB, slot 1 = birth-time VB)
             render_pass.set_pipeline(&self.map_pipeline);
             render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
             render_pass.set_bind_group(1, self.textures.material_bind_group().unwrap(), &[]);
             for tile in &tile_list {
                 render_pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, tile.birth_buffer.slice(..));
                 render_pass.set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..tile.num_indices, 0, 0..1);
             }
@@ -465,8 +503,13 @@ impl Renderer {
                 render_pass.set_bind_group(1, self.textures.material_bind_group().unwrap(), &[]);
                 for tile in &tile_list {
                     if tile.num_shadow_indices > 0 {
-                        if let (Some(svb), Some(sib)) = (&tile.shadow_vertex_buffer, &tile.shadow_index_buffer) {
+                        if let (Some(svb), Some(sbb), Some(sib)) = (
+                            &tile.shadow_vertex_buffer,
+                            &tile.shadow_birth_buffer,
+                            &tile.shadow_index_buffer,
+                        ) {
                             render_pass.set_vertex_buffer(0, svb.slice(..));
+                            render_pass.set_vertex_buffer(1, sbb.slice(..));
                             render_pass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
                             render_pass.draw_indexed(0..tile.num_shadow_indices, 0, 0..1);
                         }

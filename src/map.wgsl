@@ -32,6 +32,10 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) material: f32,
+    // Per-vertex tile birth time, in seconds since app start. Comes from a
+    // parallel vertex buffer (same vertex count). Used by the fragment shader
+    // to fade the tile in smoothly on load.
+    @location(3) birth_time: f32,
 };
 
 struct VertexOutput {
@@ -39,6 +43,7 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) world_pos: vec3<f32>,
     @location(2) material: f32,
+    @location(3) birth_time: f32,
 };
 
 @vertex
@@ -48,6 +53,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
     out.world_pos = in.position;
     out.material = in.material;
+    out.birth_time = in.birth_time;
 
     // Subtle vertex AO: only brighten roofs, don't darken bases
     // (darkening bases causes visible artifacts at tile boundaries)
@@ -62,6 +68,16 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.color = vc;
 
     return out;
+}
+
+// Tile fade-in: ramps from 0 → 1 over ~400 ms from each vertex's birth time.
+// If birth_time is 0 (legacy/single-shot path) the tile is always fully visible.
+fn tile_fade(birth_time: f32, now: f32) -> f32 {
+    if birth_time <= 0.0 {
+        return 1.0;
+    }
+    let age = now - birth_time;
+    return smoothstep(0.0, 0.4, age);
 }
 
 // ============================================================
@@ -392,23 +408,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fog_factor = smoothstep(0.85, 1.3, screen_dist) * 0.7; // starts near edge, 70% at corners
     color = mix(color, fog_color, fog_factor);
 
-    return vec4<f32>(color, in.color.a);
+    let fade = tile_fade(in.birth_time, camera.time);
+    return vec4<f32>(color, in.color.a * fade);
 }
 
 // Shadow/overlay fragment shader — handles both shadows (black+alpha) and clouds (white+alpha)
 @fragment
 fn fs_shadow(in: VertexOutput) -> @location(0) vec4<f32> {
     let mat = i32(round(in.material));
+    let fade = tile_fade(in.birth_time, camera.time);
     if mat == 12 {
         // Cloud: white with vertex alpha, slight animated variation
         let drift = vec2<f32>(camera.time * 0.06, camera.time * 0.04);
         let uv = in.world_pos.xy * 0.3 + drift;
         let density = fbm3(uv) * 0.4 + 0.6;
-        let alpha = in.color.a * density;
+        let alpha = in.color.a * density * fade;
         return vec4<f32>(1.0, 1.0, 1.0, alpha);
     }
     // Shadow: black with vertex alpha
-    return vec4<f32>(0.0, 0.0, 0.0, in.color.a);
+    return vec4<f32>(0.0, 0.0, 0.0, in.color.a * fade);
 }
 
 // ============================================================
