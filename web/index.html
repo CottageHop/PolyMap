@@ -397,6 +397,16 @@
                         </div>
                         <div class="theme-label">Cottage Core</div>
                     </button>
+                    <button class="theme-btn" data-theme="cottagecoredark" onclick="applyTheme('cottagecoredark')">
+                        <div class="theme-swatches">
+                            <span style="background:#1a2e1a"></span>
+                            <span style="background:#d9b08f"></span>
+                            <span style="background:#3e6b28"></span>
+                            <span style="background:#4a7fb0"></span>
+                            <span style="background:#9a9a9a"></span>
+                        </div>
+                        <div class="theme-label">Cottage Core Dark</div>
+                    </button>
                     <button class="theme-btn" data-theme="cyberpunk" onclick="applyTheme('cyberpunk')">
                         <div class="theme-swatches">
                             <span style="background:#0c1020"></span>
@@ -506,6 +516,10 @@
                     <input type="color" id="color-road" value="#8c7061">
                 </div>
                 <div class="color-row">
+                    <label>Rails</label>
+                    <input type="color" id="color-rail" value="#7b5a47">
+                </div>
+                <div class="color-row">
                     <label>Background</label>
                     <input type="color" id="color-land" value="#f2e6d9">
                 </div>
@@ -580,6 +594,11 @@
                 road: '#8c7061', land: '#f2e6d9', marker: '#c0392b',
                 cloudOpacity: 50, clouds: true, useDefaults: true,
             },
+            cottagecoredark: {
+                water: '#4a7fb0', park: '#3e6b28', building: '#d9b08f',
+                road: '#9a9a9a', land: '#1a2e1a', marker: '#c0392b',
+                cloudOpacity: 2, clouds: true,
+            },
             cyberpunk: {
                 water: '#0a1628', park: '#1a0a12', building: '#a82929',
                 road: '#00d4e8', land: '#0c1020', marker: '#f0c800',
@@ -626,6 +645,7 @@
             document.getElementById('color-park').value = t.park;
             document.getElementById('color-building').value = t.building;
             document.getElementById('color-road').value = t.road;
+            document.getElementById('color-rail').value = t.rail || '#7b5a47';
             document.getElementById('color-land').value = t.land;
             document.getElementById('color-marker').value = t.marker;
             document.documentElement.style.setProperty('--marker-color', t.marker);
@@ -634,7 +654,7 @@
             if (t.useDefaults) {
                 map.setColors({
                     water: [0, 0, 0, 0], park: [0, 0, 0, 0], building: [0, 0, 0, 0],
-                    road: [0, 0, 0, 0], land: [0, 0, 0, 0],
+                    road: [0, 0, 0, 0], land: [0, 0, 0, 0], rail: [0, 0, 0, 0],
                 });
             } else {
                 map.setColors({
@@ -643,6 +663,7 @@
                     building: hexToRgba(t.building),
                     road: hexToRgba(t.road),
                     land: hexToRgba(t.land),
+                    rail: t.rail ? hexToRgba(t.rail) : [0, 0, 0, 0],
                 });
             }
 
@@ -685,6 +706,7 @@
         bindColorPicker('color-park', 'park');
         bindColorPicker('color-building', 'building');
         bindColorPicker('color-road', 'road');
+        bindColorPicker('color-rail', 'rail');
         bindColorPicker('color-land', 'land');
 
         // Marker color picker — updates CSS custom property on all markers

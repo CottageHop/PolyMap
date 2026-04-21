@@ -15,7 +15,7 @@ use crate::mapdata::{
     COLOR_RAIL, COLOR_RAIL_TIE, COLOR_ROAD_OUTLINE, COLOR_SHADOW_CORE, COLOR_SHADOW_EDGE, COLOR_SHADOW_MID, COLOR_SIDEWALK,
     COLOR_SIDEWALK_OUTLINE, COLOR_SKYSCRAPER, COLOR_WATER, MAT_BUILDING, MAT_BUILDING_WALL,
     MAT_COBBLESTONE, MAT_COMMERCIAL, MAT_DEFAULT, MAT_GLASS, MAT_GLASS_WALL, MAT_GRASS,
-    MAT_INDUSTRIAL, MAT_RESIDENTIAL, MAT_ROAD, MAT_WATER,
+    MAT_INDUSTRIAL, MAT_RAIL, MAT_RAIL_TIE, MAT_RESIDENTIAL, MAT_ROAD, MAT_WATER,
     SHADOW_BLUR, SHADOW_DIR, Z_LANDUSE, Z_LANDUSE_DETAIL, Z_PARK, Z_PATH_FILL,
     Z_PATH_OUTLINE, Z_ROAD_FILL, Z_ROAD_OUTLINE, Z_WATER,
 };
@@ -461,15 +461,15 @@ pub fn mvt_to_mapdata(
             continue;
         }
         let width = road_width(road_type);
-        let color = match road_type {
-            RoadType::Major => COLOR_ROAD_MAJOR,
-            RoadType::Minor | RoadType::Residential => COLOR_ROAD_MINOR,
-            RoadType::Rail => COLOR_RAIL,
+        let (color, material) = match road_type {
+            RoadType::Major => (COLOR_ROAD_MAJOR, MAT_ROAD),
+            RoadType::Minor | RoadType::Residential => (COLOR_ROAD_MINOR, MAT_ROAD),
+            RoadType::Rail => (COLOR_RAIL, MAT_RAIL),
             RoadType::Path => continue,
         };
         let start_vert = vertices.len();
         generate_line_geometry(
-            coords, width, color, MAT_ROAD,
+            coords, width, color, material,
             &mut vertices, &mut indices,
         );
         for v in &mut vertices[start_vert..] {
@@ -507,10 +507,10 @@ pub fn mvt_to_mapdata(
                     let v2 = [cx - ux * hl + px * hw, cy - uy * hl + py * hw];
                     let v3 = [cx + ux * hl + px * hw, cy + uy * hl + py * hw];
                     let base = vertices.len() as u32;
-                    vertices.push(MapVertex::at_height(v0[0], v0[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
-                    vertices.push(MapVertex::at_height(v1[0], v1[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
-                    vertices.push(MapVertex::at_height(v2[0], v2[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
-                    vertices.push(MapVertex::at_height(v3[0], v3[1], tie_z, COLOR_RAIL_TIE, MAT_ROAD));
+                    vertices.push(MapVertex::at_height(v0[0], v0[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    vertices.push(MapVertex::at_height(v1[0], v1[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    vertices.push(MapVertex::at_height(v2[0], v2[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    vertices.push(MapVertex::at_height(v3[0], v3[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
                     indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
                     next_tie += TIE_SPACING;
                 }

@@ -19,6 +19,7 @@ struct CameraUniform {
     building_tint: vec4<f32>,
     road_tint: vec4<f32>,
     land_tint: vec4<f32>,
+    rail_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)

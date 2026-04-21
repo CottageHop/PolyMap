@@ -43,6 +43,8 @@ pub struct ColorConfig {
     pub skyscraper: Option<[f32; 4]>,
     pub park: Option<[f32; 4]>,
     pub sidewalk: Option<[f32; 4]>,
+    /// Rail tint. Applied to both the rail base and crossties (ties auto-darken).
+    pub rail: Option<[f32; 4]>,
 }
 
 /// Layer visibility toggles.

@@ -68,6 +68,7 @@ pub struct App {
     building_tint: [f32; 4],
     road_tint: [f32; 4],
     land_tint: [f32; 4],
+    rail_tint: [f32; 4],
     ready_emitted: bool,
     markers_dirty: bool,
     labels_dirty: bool,
@@ -125,6 +126,7 @@ impl App {
             building_tint: [0.0; 4],
             road_tint: [0.0; 4],
             land_tint: [0.0; 4],
+            rail_tint: [0.0; 4],
             ready_emitted: false,
             markers_dirty: false,
             labels_dirty: false,
@@ -255,6 +257,7 @@ impl App {
                         if let Some(c) = colors.building { self.building_tint = c; }
                         if let Some(c) = colors.road { self.road_tint = c; }
                         if let Some(c) = colors.land { self.land_tint = c; }
+                        if let Some(c) = colors.rail { self.rail_tint = c; }
                         self.labels_dirty = true; // rebuild labels with new theme colors
                     }
                     api::Command::UploadBackgroundTexture { width, height, rgba_data } => {
@@ -894,6 +897,7 @@ impl ApplicationHandler for App {
                     uniform.building_tint = self.building_tint;
                     uniform.road_tint = self.road_tint;
                     uniform.land_tint = self.land_tint;
+                    uniform.rail_tint = self.rail_tint;
                     gpu.queue.write_buffer(&gpu.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
 
                     // Clear color must be in linear space for sRGB surfaces.
@@ -1131,6 +1135,7 @@ impl App {
             uniform.building_tint = self.building_tint;
             uniform.road_tint = self.road_tint;
             uniform.land_tint = self.land_tint;
+            uniform.rail_tint = self.rail_tint;
             gpu.queue.write_buffer(&gpu.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
 
             let clear = if self.land_tint[3] > 0.5 {

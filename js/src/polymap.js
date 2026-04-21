@@ -509,7 +509,7 @@ class PolyMapInstance {
     const t = THEMES[name];
     if (!t) return this;
     if (t.useDefaults) {
-      this.setColors({ water: [0,0,0,0], park: [0,0,0,0], building: [0,0,0,0], road: [0,0,0,0], land: [0,0,0,0] });
+      this.setColors({ water: [0,0,0,0], park: [0,0,0,0], building: [0,0,0,0], road: [0,0,0,0], land: [0,0,0,0], rail: [0,0,0,0] });
     } else {
       this.setColors({
         water: HEX_TO_RGBA(t.water),
@@ -517,6 +517,9 @@ class PolyMapInstance {
         building: HEX_TO_RGBA(t.building),
         road: HEX_TO_RGBA(t.road),
         land: HEX_TO_RGBA(t.land),
+        // Themes can optionally define t.rail; fall back to clearing the
+        // rail tint so the vertex default (COLOR_RAIL) shows through.
+        rail: t.rail ? HEX_TO_RGBA(t.rail) : [0,0,0,0],
       });
     }
     this.setCloudOpacity(t.cloudOpacity / 100);
@@ -576,7 +579,7 @@ function createControlsPanel(container, map) {
     // Apply colors + clouds via the shared instance method.
     map.applyTheme(name);
     // Sync panel UI to reflect the new theme.
-    for (const [key, id] of [['water','ctrl-water'],['park','ctrl-park'],['building','ctrl-building'],['road','ctrl-road'],['land','ctrl-land'],['marker','ctrl-marker']]) {
+    for (const [key, id] of [['water','ctrl-water'],['park','ctrl-park'],['building','ctrl-building'],['road','ctrl-road'],['land','ctrl-land'],['rail','ctrl-rail'],['marker','ctrl-marker']]) {
       const el = panel.querySelector('#' + id);
       if (el) el.value = t[key];
     }
@@ -641,6 +644,7 @@ function createControlsPanel(container, map) {
         <div class="pm-row"><label>Green Space</label><input type="color" id="ctrl-park" value="#8c9959"></div>
         <div class="pm-row"><label>Buildings</label><input type="color" id="ctrl-building" value="#d9b08f"></div>
         <div class="pm-row"><label>Roads</label><input type="color" id="ctrl-road" value="#8c7061"></div>
+        <div class="pm-row"><label>Rails</label><input type="color" id="ctrl-rail" value="#7b5a47"></div>
         <div class="pm-row"><label>Background</label><input type="color" id="ctrl-land" value="#f2e6d9"></div>
         <div class="pm-row"><label>Markers</label><input type="color" id="ctrl-marker" value="#c0392b"></div>
         <button class="pm-reset">Reset Colors</button>
@@ -667,7 +671,7 @@ function createControlsPanel(container, map) {
   });
 
   // Color pickers
-  for (const [id, key] of [['ctrl-water','water'],['ctrl-park','park'],['ctrl-building','building'],['ctrl-road','road'],['ctrl-land','land']]) {
+  for (const [id, key] of [['ctrl-water','water'],['ctrl-park','park'],['ctrl-building','building'],['ctrl-road','road'],['ctrl-rail','rail'],['ctrl-land','land']]) {
     panel.querySelector('#' + id)?.addEventListener('input', (e) => {
       map.setColors({ [key]: hexToRgba(e.target.value) });
     });

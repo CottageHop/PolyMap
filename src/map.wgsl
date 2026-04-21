@@ -18,6 +18,7 @@ struct CameraUniform {
     building_tint: vec4<f32>,
     road_tint: vec4<f32>,
     land_tint: vec4<f32>,
+    rail_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -260,10 +261,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_park = mat == 3 || mat == 6;
     let is_building = mat == 2 || mat == 5 || mat == 9 || mat == 10;
     let is_road = mat == 1 || mat == 8;
-    let is_land = !is_water && !is_park && !is_building && !is_road
+    let is_rail = mat == 17 || mat == 18; // MAT_RAIL | MAT_RAIL_TIE
+    let is_land = !is_water && !is_park && !is_building && !is_road && !is_rail
                   && mat != 12 && mat != 13; // exclude clouds and pins
 
-    if camera.water_tint.a > 0.5 && is_water {
+    if camera.rail_tint.a > 0.5 && is_rail {
+        // Ties auto-darken to ~0.7× of the picked rail color so the
+        // tie/rail contrast stays even with a single user-chosen hue.
+        if mat == 18 {
+            color = camera.rail_tint.rgb * 0.7;
+        } else {
+            color = camera.rail_tint.rgb;
+        }
+    } else if camera.water_tint.a > 0.5 && is_water {
         color = camera.water_tint.rgb;
     } else if camera.park_tint.a > 0.5 && is_park {
         color = camera.park_tint.rgb;

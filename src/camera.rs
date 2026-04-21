@@ -54,6 +54,9 @@ pub struct CameraUniform {
     pub building_tint: [f32; 4],
     pub road_tint: [f32; 4],
     pub land_tint: [f32; 4],
+    /// Rail tint. Applies to both rail base and crossties (ties auto-darken
+    /// to ~0.7× the picked color to keep the track pattern readable).
+    pub rail_tint: [f32; 4],
 }
 
 impl Default for CameraUniform {
@@ -74,6 +77,7 @@ impl Default for CameraUniform {
             building_tint: [0.0; 4],
             road_tint: [0.0; 4],
             land_tint: [0.0; 4],
+            rail_tint: [0.0; 4],
         }
     }
 }
@@ -229,6 +233,7 @@ impl Camera {
             building_tint: [0.0; 4],
             road_tint: [0.0; 4],
             land_tint: [0.0; 4],
+            rail_tint: [0.0; 4],
         }
     }
 
