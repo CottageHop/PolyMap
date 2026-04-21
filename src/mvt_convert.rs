@@ -555,6 +555,7 @@ pub fn mvt_to_mapdata(
                 }
             }
 
+            let labels_before = labels.len();
             let mut walked = 0.0f32;
             let mut next_label_at = label_spacing * 0.5;
             for i in 0..coords.len() - 1 {
@@ -584,6 +585,48 @@ pub fn mvt_to_mapdata(
                 }
 
                 walked += seg_len;
+            }
+
+            // Guaranteed coverage: every named road with length > 0 gets at
+            // least one label. Without this, short roads (< label_spacing/2)
+            // and entirely-curved roads (no straight segments) render
+            // anonymously even when they're fully visible.
+            if labels.len() == labels_before {
+                let mut total_len = 0.0f32;
+                for i in 0..coords.len() - 1 {
+                    let dx = coords[i + 1][0] - coords[i][0];
+                    let dy = coords[i + 1][1] - coords[i][1];
+                    total_len += (dx * dx + dy * dy).sqrt();
+                }
+                if total_len > 1e-6 {
+                    // Walk to the polyline midpoint and place one label there.
+                    let target = total_len * 0.5;
+                    let mut walked = 0.0f32;
+                    for i in 0..coords.len() - 1 {
+                        let dx = coords[i + 1][0] - coords[i][0];
+                        let dy = coords[i + 1][1] - coords[i][1];
+                        let seg_len = (dx * dx + dy * dy).sqrt();
+                        if walked + seg_len >= target && seg_len > 1e-8 {
+                            let t = (target - walked) / seg_len;
+                            let pos = [coords[i][0] + dx * t, coords[i][1] + dy * t];
+                            let mut angle = (-dy).atan2(dx);
+                            if angle > std::f32::consts::FRAC_PI_2 {
+                                angle -= std::f32::consts::PI;
+                            } else if angle < -std::f32::consts::FRAC_PI_2 {
+                                angle += std::f32::consts::PI;
+                            }
+                            labels.push(Label {
+                                text: name.clone(),
+                                position: pos,
+                                angle,
+                                kind: LabelKind::Street,
+                                path: Some(coords.clone()),
+                            });
+                            break;
+                        }
+                        walked += seg_len;
+                    }
+                }
             }
         }
     }
