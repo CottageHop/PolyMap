@@ -529,8 +529,9 @@ function createControlsPanel(container, map) {
   };
 
   const THEMES = {
-    cottagecore: { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
-    cyberpunk:   { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0, clouds:false },
+    cottagecore:     { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
+    cottagecoredark: { water:'#4a7fb0', park:'#3e6b28', building:'#d9b08f', road:'#9a9a9a', land:'#1a2e1a', marker:'#c0392b', cloudOpacity:10, clouds:true },
+    cyberpunk:       { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0, clouds:false },
     modern:      { water:'#42a5f5', park:'#8bc34a', building:'#e0e0e0', road:'#bdbdbd', land:'#f5f5f5', marker:'#1976d2', cloudOpacity:30, clouds:true },
     greyscale:   { water:'#888888', park:'#aaaaaa', building:'#666666', road:'#777777', land:'#f0f0f0', marker:'#444444', cloudOpacity:20, clouds:true },
     dark:        { water:'#1a3a4a', park:'#1e3a1e', building:'#2a2a2a', road:'#5a5a5a', land:'#1a1a1a', marker:'#e0e0e0', cloudOpacity:15, clouds:true },
@@ -597,7 +598,7 @@ function createControlsPanel(container, map) {
   panel.appendChild(style);
 
   const themeButtons = Object.entries(THEMES).map(([name, t]) => {
-    const label = { cottagecore:'Cottage Core', cyberpunk:'Cyberpunk', modern:'Modern', greyscale:'Greyscale', dark:'Dark', eighties:"80's", seventies:"70's", oldworld:'Old World' }[name] || name;
+    const label = { cottagecore:'Cottage Core', cottagecoredark:'Cottage Core Dark', cyberpunk:'Cyberpunk', modern:'Modern', greyscale:'Greyscale', dark:'Dark', eighties:"80's", seventies:"70's", oldworld:'Old World' }[name] || name;
     const colors = [t.land, t.building, t.park, t.water, t.road];
     return `<button class="pm-theme-btn${name==='cottagecore'?' active':''}" data-theme="${name}"><div class="pm-swatches">${colors.map(c=>`<span style="background:${c}"></span>`).join('')}</div><div class="pm-theme-lbl">${label}</div></button>`;
   }).join('');
