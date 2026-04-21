@@ -12,10 +12,10 @@ use crate::mapdata::{
     triangulate_polygon_at_height, Label, LabelKind, MapData, MapVertex, RoadType,
     COLOR_BUILDING, COLOR_COMMERCIAL, COLOR_INDUSTRIAL, COLOR_LAND,
     COLOR_PARK, COLOR_RESIDENTIAL, COLOR_ROAD_MAJOR, COLOR_ROAD_MINOR,
-    COLOR_RAIL, COLOR_ROAD_OUTLINE, COLOR_SHADOW_CORE, COLOR_SHADOW_EDGE, COLOR_SHADOW_MID, COLOR_SIDEWALK,
+    COLOR_RAIL, COLOR_RAIL_TIE, COLOR_ROAD_OUTLINE, COLOR_SHADOW_CORE, COLOR_SHADOW_EDGE, COLOR_SHADOW_MID, COLOR_SIDEWALK,
     COLOR_SIDEWALK_OUTLINE, COLOR_SKYSCRAPER, COLOR_WATER, MAT_BUILDING, MAT_BUILDING_WALL,
     MAT_COBBLESTONE, MAT_COMMERCIAL, MAT_DEFAULT, MAT_GLASS, MAT_GLASS_WALL, MAT_GRASS,
-    MAT_INDUSTRIAL, MAT_RESIDENTIAL, MAT_ROAD, MAT_WATER,
+    MAT_INDUSTRIAL, MAT_RAIL, MAT_RAIL_TIE, MAT_RESIDENTIAL, MAT_ROAD, MAT_WATER,
     SHADOW_BLUR, SHADOW_DIR, Z_LANDUSE, Z_LANDUSE_DETAIL, Z_PARK, Z_PATH_FILL,
     Z_PATH_OUTLINE, Z_ROAD_FILL, Z_ROAD_OUTLINE, Z_WATER,
 };
@@ -461,19 +461,60 @@ pub fn mvt_to_mapdata(
             continue;
         }
         let width = road_width(road_type);
-        let color = match road_type {
-            RoadType::Major => COLOR_ROAD_MAJOR,
-            RoadType::Minor | RoadType::Residential => COLOR_ROAD_MINOR,
-            RoadType::Rail => COLOR_RAIL,
+        let (color, material) = match road_type {
+            RoadType::Major => (COLOR_ROAD_MAJOR, MAT_ROAD),
+            RoadType::Minor | RoadType::Residential => (COLOR_ROAD_MINOR, MAT_ROAD),
+            RoadType::Rail => (COLOR_RAIL, MAT_RAIL),
             RoadType::Path => continue,
         };
         let start_vert = vertices.len();
         generate_line_geometry(
-            coords, width, color, MAT_ROAD,
+            coords, width, color, material,
             &mut vertices, &mut indices,
         );
         for v in &mut vertices[start_vert..] {
             v.position[2] = Z_ROAD_FILL;
+        }
+
+        // Railroad crossties — perpendicular bars along the rail path.
+        if matches!(road_type, RoadType::Rail) && coords.len() >= 2 {
+            const TIE_SPACING: f32 = 1.6;
+            const TIE_HALF_WIDTH: f32 = 0.30;
+            const TIE_HALF_LEN: f32 = 0.10;
+            let tie_z = Z_ROAD_FILL + 0.0005;
+
+            let mut walked = 0.0f32;
+            let mut next_tie = TIE_SPACING * 0.5;
+            for i in 0..coords.len() - 1 {
+                let dx = coords[i + 1][0] - coords[i][0];
+                let dy = coords[i + 1][1] - coords[i][1];
+                let seg_len = (dx * dx + dy * dy).sqrt();
+                if seg_len < 1e-6 { continue; }
+                let ux = dx / seg_len;
+                let uy = dy / seg_len;
+                let px = -uy;
+                let py = ux;
+
+                while walked + seg_len >= next_tie {
+                    let t_local = next_tie - walked;
+                    let cx = coords[i][0] + ux * t_local;
+                    let cy = coords[i][1] + uy * t_local;
+                    let hl = TIE_HALF_LEN;
+                    let hw = TIE_HALF_WIDTH;
+                    let v0 = [cx - ux * hl - px * hw, cy - uy * hl - py * hw];
+                    let v1 = [cx + ux * hl - px * hw, cy + uy * hl - py * hw];
+                    let v2 = [cx - ux * hl + px * hw, cy - uy * hl + py * hw];
+                    let v3 = [cx + ux * hl + px * hw, cy + uy * hl + py * hw];
+                    let base = vertices.len() as u32;
+                    vertices.push(MapVertex::at_height(v0[0], v0[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    vertices.push(MapVertex::at_height(v1[0], v1[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    vertices.push(MapVertex::at_height(v2[0], v2[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    vertices.push(MapVertex::at_height(v3[0], v3[1], tie_z, COLOR_RAIL_TIE, MAT_RAIL_TIE));
+                    indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+                    next_tie += TIE_SPACING;
+                }
+                walked += seg_len;
+            }
         }
     }
 
@@ -513,6 +554,7 @@ pub fn mvt_to_mapdata(
                 }
             }
 
+            let labels_before = labels.len();
             let mut walked = 0.0f32;
             let mut next_label_at = label_spacing * 0.5;
             for i in 0..coords.len() - 1 {
@@ -542,6 +584,46 @@ pub fn mvt_to_mapdata(
                 }
 
                 walked += seg_len;
+            }
+
+            // Coverage fallback: every named road with non-zero length gets
+            // at least one label, even if entirely curved or too short for
+            // the straight-run loop to hit.
+            if labels.len() == labels_before {
+                let mut total_len = 0.0f32;
+                for i in 0..coords.len() - 1 {
+                    let dx = coords[i + 1][0] - coords[i][0];
+                    let dy = coords[i + 1][1] - coords[i][1];
+                    total_len += (dx * dx + dy * dy).sqrt();
+                }
+                if total_len > 1e-6 {
+                    let target = total_len * 0.5;
+                    let mut walked = 0.0f32;
+                    for i in 0..coords.len() - 1 {
+                        let dx = coords[i + 1][0] - coords[i][0];
+                        let dy = coords[i + 1][1] - coords[i][1];
+                        let seg_len = (dx * dx + dy * dy).sqrt();
+                        if walked + seg_len >= target && seg_len > 1e-8 {
+                            let t = (target - walked) / seg_len;
+                            let pos = [coords[i][0] + dx * t, coords[i][1] + dy * t];
+                            let mut angle = (-dy).atan2(dx);
+                            if angle > std::f32::consts::FRAC_PI_2 {
+                                angle -= std::f32::consts::PI;
+                            } else if angle < -std::f32::consts::FRAC_PI_2 {
+                                angle += std::f32::consts::PI;
+                            }
+                            labels.push(Label {
+                                text: name.clone(),
+                                position: pos,
+                                angle,
+                                kind: LabelKind::Street,
+                                path: Some(coords.clone()),
+                            });
+                            break;
+                        }
+                        walked += seg_len;
+                    }
+                }
             }
         }
     }

@@ -27,6 +27,10 @@ pub const MAT_FOUNTAIN: f32 = 11.0;
 pub const MAT_CLOUD: f32 = 12.0;
 /// Material for home listing pin.
 pub const MAT_PIN: f32 = 13.0;
+/// Material for railroad rail base.
+pub const MAT_RAIL: f32 = 17.0;
+/// Material for railroad crossties (auto-darken in shader).
+pub const MAT_RAIL_TIE: f32 = 18.0;
 /// Material for commercial zones.
 pub const MAT_COMMERCIAL: f32 = 14.0;
 /// Material for residential zones.
