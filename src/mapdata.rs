@@ -105,7 +105,9 @@ impl Label {
             LabelKind::State => 2.0,
             LabelKind::City => 1.5,
             LabelKind::Subdivision => 0.9,
-            LabelKind::Street => 0.38,
+            // Street labels match POI (business) labels in both size and
+            // spacing so the text reads as the same weight class.
+            LabelKind::Street => 0.18,
             LabelKind::Park => 0.6,
             LabelKind::Building => 0.4,
             LabelKind::Listing => 0.65,
@@ -119,7 +121,7 @@ impl Label {
             LabelKind::State => 1.5,
             LabelKind::City => 1.35,
             LabelKind::Subdivision => 1.25,
-            LabelKind::Street => 1.35,
+            LabelKind::Street => 1.0,
             LabelKind::Park => 1.1,
             LabelKind::Building => 1.0,
             LabelKind::Listing => 1.0,
