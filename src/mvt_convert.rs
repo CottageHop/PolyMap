@@ -479,9 +479,9 @@ pub fn mvt_to_mapdata(
         // Railroad crossties — perpendicular bars along the rail path so
         // tracks read distinctly from ordinary roads.
         if matches!(road_type, RoadType::Rail) && coords.len() >= 2 {
-            const TIE_SPACING: f32 = 2.0;  // world units between tie centers
-            const TIE_HALF_WIDTH: f32 = 0.4;  // perpendicular to rail (total width 0.8)
-            const TIE_HALF_LEN: f32 = 0.25;   // along rail direction (total 0.5)
+            const TIE_SPACING: f32 = 1.6;     // world units between tie centers
+            const TIE_HALF_WIDTH: f32 = 0.30; // perpendicular to rail (total 0.6)
+            const TIE_HALF_LEN: f32 = 0.10;   // along rail direction (total 0.2 — slim)
             let tie_z = Z_ROAD_FILL + 0.0005;
 
             let mut walked = 0.0f32;

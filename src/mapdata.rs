@@ -1248,7 +1248,7 @@ pub(crate) fn road_width(road_type: &RoadType) -> f32 {
         RoadType::Minor => 0.45,
         RoadType::Residential => 0.30,
         RoadType::Path => 0.16,
-        RoadType::Rail => 0.20,
+        RoadType::Rail => 0.10,
     }
 }
 
