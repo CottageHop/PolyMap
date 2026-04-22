@@ -60,6 +60,7 @@ pub struct LayerConfig {
     pub parcels: Option<bool>,
     pub clouds: Option<bool>,
     pub cars: Option<bool>,
+    pub noise: Option<bool>,
 }
 
 /// Runtime layer visibility state.
@@ -75,6 +76,7 @@ pub struct LayerVisibility {
     pub parcels: bool,
     pub clouds: bool,
     pub cars: bool,
+    pub noise: bool,
 }
 
 impl Default for LayerVisibility {
@@ -92,6 +94,9 @@ impl Default for LayerVisibility {
             // Cars are an experimental feature — off by default, toggle via
             // setLayerVisible('cars', true) in devtools.
             cars: false,
+            // Noise heat-map overlay — off by default. Host supplies sources
+            // via map.setNoiseSources(...) then toggles via setLayerVisible('noise', true).
+            noise: false,
         }
     }
 }
@@ -108,5 +113,6 @@ impl LayerVisibility {
         if let Some(v) = config.parcels { self.parcels = v; }
         if let Some(v) = config.clouds { self.clouds = v; }
         if let Some(v) = config.cars { self.cars = v; }
+        if let Some(v) = config.noise { self.noise = v; }
     }
 }

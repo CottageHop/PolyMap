@@ -5,6 +5,7 @@ pub mod gpu;
 pub mod mapdata;
 pub mod mvt;
 pub mod mvt_convert;
+pub mod noise;
 pub mod renderer;
 pub mod text;
 pub mod texture;
@@ -242,6 +243,7 @@ impl App {
                             "labels" => self.layer_visibility.labels = visible,
                             "clouds" => self.layer_visibility.clouds = visible,
                             "cars" => self.layer_visibility.cars = visible,
+                            "noise" => self.layer_visibility.noise = visible,
                             _ => log::warn!("Unknown layer: {}", layer),
                         }
                     }
@@ -259,6 +261,25 @@ impl App {
                         if let Some(c) = colors.land { self.land_tint = c; }
                         if let Some(c) = colors.rail { self.rail_tint = c; }
                         self.labels_dirty = true; // rebuild labels with new theme colors
+                    }
+                    api::Command::SetNoiseSources(sources) => {
+                        // Project lat/lon → world via the active projection origin.
+                        let center = if let Some(data) = &self.map_data {
+                            Some((data.center_lat, data.center_lon))
+                        } else if let Some(tm) = &self.tile_manager {
+                            Some((tm.center_lat, tm.center_lon))
+                        } else {
+                            None
+                        };
+                        if let Some((clat, clon)) = center {
+                            let packed: Vec<crate::noise::NoiseSource> = sources.iter().map(|(lat, lon, db)| {
+                                let pos = mapdata::project_pub(*lat, *lon, clat, clon);
+                                crate::noise::NoiseSource { pos, db: *db, _pad: 0.0 }
+                            }).collect();
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.noise.set_sources(&packed);
+                            }
+                        }
                     }
                     api::Command::UploadBackgroundTexture { width, height, rgba_data } => {
                         if let (Some(gpu), Some(renderer)) = (&self.gpu, &mut self.renderer) {
@@ -826,6 +847,11 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Flush any pending noise-source uploads (cheap no-op when clean).
+                if let (Some(gpu), Some(renderer)) = (&self.gpu, self.renderer.as_mut()) {
+                    renderer.noise.flush(gpu);
+                }
+
                 if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
                     // Always update camera state FIRST so getCamera() returns valid
                     // data when JS callbacks (like ready) call it synchronously.
@@ -1080,6 +1106,11 @@ impl App {
                 let cars_iter = tm.loaded_tiles().flat_map(|t| t.cars.iter());
                 renderer.cars.update(gpu, cars_iter, elapsed);
             }
+        }
+
+        // Flush pending noise-source uploads.
+        if let (Some(gpu), Some(renderer)) = (&self.gpu, self.renderer.as_mut()) {
+            renderer.noise.flush(gpu);
         }
 
         if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {

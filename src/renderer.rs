@@ -2,6 +2,7 @@ use crate::cars::CarsSystem;
 use crate::config::LayerVisibility;
 use crate::gpu::GpuState;
 use crate::mapdata::{MapData, MapVertex};
+use crate::noise::NoiseSystem;
 use crate::text::TextSystem;
 use crate::texture::TextureSystem;
 
@@ -22,6 +23,7 @@ pub struct Renderer {
     num_shadow_indices: u32,
     pub text: TextSystem,
     pub cars: CarsSystem,
+    pub noise: NoiseSystem,
     pub textures: TextureSystem,
 }
 
@@ -246,6 +248,7 @@ impl Renderer {
         );
 
         let cars = CarsSystem::new(gpu);
+        let noise = NoiseSystem::new(gpu);
 
         Self {
             map_pipeline,
@@ -261,6 +264,7 @@ impl Renderer {
             num_shadow_indices: 0,
             text,
             cars,
+            noise,
             textures,
         }
     }
@@ -414,6 +418,11 @@ impl Renderer {
             if layers.clouds {
                 self.render_clouds(&mut render_pass, &gpu.camera_bind_group);
             }
+
+            // Pass 6: Noise heat-map overlay (fullscreen)
+            if layers.noise {
+                self.noise.render(&mut render_pass, &gpu.camera_bind_group);
+            }
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
@@ -530,6 +539,11 @@ impl Renderer {
             // Pass 5: Procedural cloud overlay (fullscreen)
             if layers.clouds {
                 self.render_clouds(&mut render_pass, &gpu.camera_bind_group);
+            }
+
+            // Pass 6: Noise heat-map overlay (fullscreen)
+            if layers.noise {
+                self.noise.render(&mut render_pass, &gpu.camera_bind_group);
             }
         }
 

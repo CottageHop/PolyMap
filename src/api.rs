@@ -19,6 +19,10 @@ pub enum Command {
     SetColors(ColorConfig),
     SetCloudOpacity(f32),
     SetCloudSpeed(f32),
+    /// Replace the noise-heatmap source list. Each entry is (lat, lon, db).
+    /// Host should convert sources' dB to the "dB at 1 world unit" convention
+    /// the shader expects — or we can document a simple lookup table.
+    SetNoiseSources(Vec<(f64, f64, f32)>),
     LoadBbox { south: f64, west: f64, north: f64, east: f64 },
     UploadBackgroundTexture {
         width: u32,
@@ -290,6 +294,20 @@ impl PolyMap {
             serde_wasm_bindgen::from_value(config).unwrap_or_default()
         };
         push_command(Command::SetColors(parsed));
+    }
+
+    /// Replace the noise heat-map source list.
+    /// Accepts an array of `[lat, lon, db]` tuples: `[[lat, lon, db], ...]`.
+    /// `db` is the dB value at 1 world-unit distance — the shader applies
+    /// inverse-square attenuation from there. Passing an empty array clears.
+    #[wasm_bindgen(js_name = setNoiseSources)]
+    pub fn set_noise_sources(&self, sources: JsValue) {
+        let parsed: Vec<(f64, f64, f32)> = if sources.is_undefined() || sources.is_null() {
+            Vec::new()
+        } else {
+            serde_wasm_bindgen::from_value(sources).unwrap_or_default()
+        };
+        push_command(Command::SetNoiseSources(parsed));
     }
 
     // ── Events ────────────────────────────────────────────────────────
