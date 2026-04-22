@@ -673,7 +673,7 @@ function createControlsPanel(container, map) {
   // Color pickers
   for (const [id, key] of [['ctrl-water','water'],['ctrl-park','park'],['ctrl-building','building'],['ctrl-road','road'],['ctrl-rail','rail'],['ctrl-land','land']]) {
     panel.querySelector('#' + id)?.addEventListener('input', (e) => {
-      map.setColors({ [key]: hexToRgba(e.target.value) });
+      map.setColors({ [key]: HEX_TO_RGBA(e.target.value) });
     });
   }
   panel.querySelector('#ctrl-marker')?.addEventListener('input', (e) => {
