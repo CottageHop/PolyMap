@@ -97,20 +97,47 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_y = camera.position.y + (0.5 - in.uv.y) * zoom_scale;
     let pos = vec2<f32>(world_x, world_y);
 
-    // Sum power contributions across all sources.
+    // Sum power contributions + gather per-source ring phase in one loop.
     var total_power = 0.0;
+    var ring_accum = 0.0;
+    // Tunable ripple params. wavelength = world-units between ring peaks.
+    // speed = world-units/sec the rings travel outward.
+    // sharpness = higher → thinner bright bands. inv_range = how far rings travel.
+    let wavelength = 14.0;
+    let speed = 5.0;
+    let sharpness = 10.0;
+
     for (var i = 0u; i < noise_data.count; i = i + 1u) {
         let src = noise_data.sources[i];
         let d = max(distance(pos, src.pos), 1.0);
         let db_here = src.db - 20.0 * log2(d) / log2(10.0);
         // Only include audible contributions (prevents underflow).
         if db_here > 30.0 {
-            total_power = total_power + pow(10.0, db_here / 10.0);
+            let weight = pow(10.0, db_here / 10.0);
+            total_power = total_power + weight;
+
+            // Per-source phase offset so multiple sources don't pulse in lockstep.
+            let phase_offset = src.pos.x * 0.1 + src.pos.y * 0.07;
+            // Rings travel OUTWARD over time: as time grows, the peak moves
+            // to larger d. `sin(d/λ − time*speed/λ + phase)`.
+            let phase = d / wavelength - camera.time * speed / wavelength + phase_offset;
+            // Crisp bright band (rather than smooth sine).
+            let band = pow(max(0.0, sin(phase * 6.2831853)), sharpness);
+            ring_accum = ring_accum + band * weight;
         }
     }
     if total_power < 1.0 {
         discard;
     }
     let total_db = 10.0 * log2(total_power) / log2(10.0);
-    return ramp(total_db);
+
+    // Base heat-map color from summed dB.
+    var col = ramp(total_db);
+
+    // Ring highlight — normalize ring_accum against the source power so
+    // louder spots get proportionally bright bands, quiet spots don't flash.
+    let ring_strength = clamp(ring_accum / max(total_power, 1.0), 0.0, 1.0);
+    // Boost alpha + brightness wherever a ring band is passing.
+    col = vec4<f32>(col.rgb + vec3<f32>(ring_strength * 0.5), clamp(col.a + ring_strength * 0.35, 0.0, 0.9));
+    return col;
 }

@@ -892,6 +892,9 @@ impl ApplicationHandler for App {
                     let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
                     let cars_animating = self.layer_visibility.cars && self.use_tiles && self.tile_manager.as_ref()
                         .map_or(false, |tm| tm.loaded_tiles().any(|t| !t.cars.is_empty()));
+                    // Noise rings animate based on camera.time; if overlay is on, keep rendering.
+                    let noise_animating = self.layer_visibility.noise
+                        && self.renderer.as_ref().map_or(false, |_| true);
                     let needs_render = camera_moved
                         || self.frames_since_camera_moved < 3
                         || (self.use_tiles && self.tile_manager.as_ref().map_or(false, |tm| tm.tiles_changed))
@@ -902,7 +905,8 @@ impl ApplicationHandler for App {
                         || !self.first_render_done
                         || self.frames_since_gpu_init < 300
                         || clouds_animating
-                        || cars_animating;
+                        || cars_animating
+                        || noise_animating;
 
                     if !needs_render {
                         return;
@@ -1139,6 +1143,7 @@ impl App {
             let has_loading_tiles = self.use_tiles && self.tile_manager.as_ref()
                 .map_or(false, |tm| tm.tiles.values().any(|s| matches!(s, crate::tiles::TileState::Loading)));
             let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
+            let noise_animating = self.layer_visibility.noise;
             let needs_render = camera_moved
                 || self.frames_since_camera_moved < 3
                 || (self.use_tiles && self.tile_manager.as_ref().map_or(false, |tm| tm.tiles_changed))
@@ -1148,7 +1153,8 @@ impl App {
                 || !self.ready_emitted
                 || !self.first_render_done
                 || self.frames_since_gpu_init < 300
-                || clouds_animating;
+                || clouds_animating
+                || noise_animating;
 
             if !needs_render { return; }
             self.first_render_done = true;
