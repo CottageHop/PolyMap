@@ -132,6 +132,9 @@
             left: 12px;
             z-index: 30;
             width: 280px;
+            max-height: calc(100vh - 48px);
+            display: flex;
+            flex-direction: column;
             background: rgba(255, 255, 255, 0.92);
             backdrop-filter: blur(12px);
             -webkit-backdrop-filter: blur(12px);
@@ -177,7 +180,8 @@
 
         .dashboard-body {
             padding: 8px 0;
-            max-height: calc(100vh - 80px);
+            flex: 1 1 auto;
+            min-height: 0;
             overflow-y: auto;
         }
 
@@ -355,6 +359,32 @@
         }
         .reset-btn:hover { background: #f5f5f5; color: #555; border-color: #ccc; }
 
+        .font-file-label {
+            display: block;
+            width: 100%;
+            padding: 6px;
+            text-align: center;
+            background: none;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            color: #555;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .font-file-label:hover { background: #f5f5f5; border-color: #ccc; }
+        .font-current {
+            margin-top: 6px;
+            padding: 4px 6px;
+            font-size: 11px;
+            color: #999;
+            text-align: center;
+            font-style: italic;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
         #attribution {
             position: absolute;
             bottom: 4px;
@@ -477,7 +507,36 @@
                         </div>
                         <div class="theme-label">Old World</div>
                     </button>
+                    <button class="theme-btn" data-theme="middleearth" onclick="applyTheme('middleearth')">
+                        <div class="theme-swatches">
+                            <span style="background:#e8d7a8"></span>
+                            <span style="background:#8b6f47"></span>
+                            <span style="background:#4a5d3a"></span>
+                            <span style="background:#8fa6b2"></span>
+                            <span style="background:#4a3525"></span>
+                        </div>
+                        <div class="theme-label">Middle Earth</div>
+                    </button>
                 </div>
+            </div>
+
+            <!-- Noise Overlay -->
+            <div class="dashboard-section">
+                <div class="section-label">Noise Overlay</div>
+                <div class="slider-row">
+                    <label><input type="checkbox" id="noise-toggle"> Show heat map</label>
+                </div>
+            </div>
+
+            <!-- Font -->
+            <div class="dashboard-section">
+                <div class="section-label">Font</div>
+                <div class="slider-row">
+                    <label for="font-file" class="font-file-label">Load .ttf/.otf</label>
+                    <input type="file" id="font-file" accept=".ttf,.otf" style="display:none">
+                </div>
+                <div class="font-current" id="font-current">Default</div>
+                <button class="reset-btn" onclick="resetFont()">Reset Font</button>
             </div>
 
             <!-- Clouds -->
@@ -559,7 +618,8 @@
         // Create the map with configuration
         window.map = new PolyMap({
             canvas: "#polymap-canvas",
-            center: { lat: 40.765, lon: -73.980 },
+            // Lower Manhattan / Financial District — Wall St / Trinity Pl area.
+            center: { lat: 40.7065, lon: -74.009 },
             zoom: 0.8,
             tilt: 1.35,
             pmtiles_url: PMTILES_URL,
@@ -634,6 +694,11 @@
                 road: '#8b4513', land: '#e8d5a3', marker: '#8b0000',
                 cloudOpacity: 0, clouds: false,
             },
+            middleearth: {
+                water: '#8fa6b2', park: '#4a5d3a', building: '#8b6f47',
+                road: '#4a3525', rail: '#3a2818', land: '#e8d7a8', marker: '#8b2e1f',
+                cloudOpacity: 0, clouds: false,
+            },
         };
 
         window.applyTheme = (name) => {
@@ -687,6 +752,12 @@
             map.setCloudOpacity(v);
         });
 
+        // Noise overlay toggle
+        const noiseToggle = document.getElementById('noise-toggle');
+        noiseToggle.addEventListener('change', (e) => {
+            map.setLayerVisible('noise', e.target.checked);
+        });
+
         // Cloud speed slider
         const speedSlider = document.getElementById('cloud-speed');
         const speedVal = document.getElementById('cloud-speed-val');
@@ -717,78 +788,68 @@
         // Reset to default theme
         window.resetColors = () => applyTheme('cottagecore');
 
+        // Font picker — load a local .ttf/.otf and hand the bytes to WASM.
+        const fontInput = document.getElementById('font-file');
+        const fontCurrent = document.getElementById('font-current');
+        fontInput.addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            try {
+                const buf = await file.arrayBuffer();
+                map.setFont(new Uint8Array(buf));
+                fontCurrent.textContent = file.name;
+                fontCurrent.title = file.name;
+            } catch (err) {
+                console.error('Failed to load font:', err);
+            } finally {
+                // Allow re-selecting the same file in a row.
+                fontInput.value = '';
+            }
+        });
+        window.resetFont = () => {
+            map.resetFont();
+            fontCurrent.textContent = 'Default';
+            fontCurrent.title = '';
+        };
+
         // ── Map events ───────────────────────────────────────────────
 
         map.on("ready", () => {
             console.log("PolyMap ready!");
             // Add markers after map is ready
-            listings.forEach(l => map.addMarker(l.id, l.lat, l.lon));
+            markers.forEach(m => map.addMarker(m.id, m.lat, m.lon));
         });
 
         map.on("resize", (size) => {
             console.log("Resized:", size);
         });
 
-        // Example listings — some placed close together to test clustering
-        const listings = [
-            {
-                id: 'listing-1', lat: 40.7645, lon: -73.9780,
-                price: '$4,200,000', address: '432 Park Ave, Penthouse',
-                beds: 3, baths: 2.5, sqft: '3,200',
-                image: 'https://images.unsplash.com/photo-1502672260266-1c1ef2d93688?w=400&h=300&fit=crop'
-            },
-            {
-                id: 'listing-2', lat: 40.7648, lon: -73.9776,
-                price: '$1,800,000', address: '430 Park Ave, Unit 12B',
-                beds: 2, baths: 2, sqft: '1,450',
-                image: 'https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=400&h=300&fit=crop'
-            },
-            {
-                id: 'listing-3', lat: 40.7642, lon: -73.9783,
-                price: '$950,000', address: '428 Park Ave, Studio',
-                beds: 0, baths: 1, sqft: '550',
-                image: 'https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=400&h=300&fit=crop'
-            },
-            {
-                id: 'listing-4', lat: 40.768, lon: -73.982,
-                price: '$3,500,000', address: '1 Central Park S, PH',
-                beds: 4, baths: 3, sqft: '4,100',
-                image: 'https://images.unsplash.com/photo-1502672260266-1c1ef2d93688?w=400&h=300&fit=crop'
-            },
-            {
-                id: 'listing-5', lat: 40.7683, lon: -73.9816,
-                price: '$2,100,000', address: '3 Central Park S, 8A',
-                beds: 2, baths: 2, sqft: '1,800',
-                image: 'https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=400&h=300&fit=crop'
-            },
-            {
-                id: 'listing-6', lat: 40.760, lon: -73.974,
-                price: '$1,200,000', address: '155 E 50th St, 6C',
-                beds: 1, baths: 1, sqft: '850',
-                image: 'https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?w=400&h=300&fit=crop'
-            }
+        // Example POI markers — generic landmarks demonstrating the marker API.
+        // Replace with whatever your application needs: trail heads, restaurants,
+        // event venues, sensors, etc. PolyMap renders the canvas; your HTML
+        // overlay handles popup content and click behavior.
+        const markers = [
+            { id: 'marker-1', lat: 40.7064, lon: -74.0109, label: 'NYSE',           description: 'New York Stock Exchange' },
+            { id: 'marker-2', lat: 40.7080, lon: -74.0119, label: 'Trinity Church', description: 'Wall Street + Broadway' },
+            { id: 'marker-3', lat: 40.7044, lon: -74.0170, label: 'Battery Park',   description: 'Southern tip of Manhattan' },
+            { id: 'marker-4', lat: 40.7127, lon: -74.0134, label: 'World Trade',    description: 'WTC complex' },
+            { id: 'marker-5', lat: 40.7071, lon: -74.0024, label: 'Seaport',        description: 'South Street Seaport' },
         ];
 
         // Create HTML marker elements
         const markersEl = document.getElementById('markers');
-        listings.forEach(listing => {
+        markers.forEach(marker => {
             const el = document.createElement('div');
             el.className = 'map-marker';
-            el.id = listing.id;
+            el.id = marker.id;
             el.innerHTML = `
                 <div class="listing-popup">
-                    <img src="${listing.image}" alt="${listing.address}">
                     <div class="info">
-                        <div class="price">${listing.price}</div>
-                        <div class="address">${listing.address}</div>
-                        <div class="details">
-                            <div><span>${listing.beds}</span> bd</div>
-                            <div><span>${listing.baths}</span> ba</div>
-                            <div><span>${listing.sqft}</span> sqft</div>
-                        </div>
+                        <div class="price">${marker.label}</div>
+                        <div class="address">${marker.description}</div>
                     </div>
                 </div>
-                <div class="marker-pin">${listing.price}</div>
+                <div class="marker-pin">${marker.label}</div>
             `;
             // Track drag distance to distinguish click from pan
             let downPos = null;
@@ -865,7 +926,7 @@
             const ids = el._markerIds || [];
             if (ids.length === 0) return;
 
-            const pts = ids.map(id => listings.find(l => l.id === id)).filter(Boolean);
+            const pts = ids.map(id => markers.find(m => m.id === id)).filter(Boolean);
             let lat = 0, lon = 0;
             pts.forEach(p => { lat += p.lat; lon += p.lon; });
             lat /= pts.length;

@@ -28,6 +28,7 @@ const GLYPH_TABLE_SIZE: usize = 95; // 127 - 32
 /// The text rendering system: glyph atlas + GPU pipeline.
 pub struct TextSystem {
     pipeline: wgpu::RenderPipeline,
+    atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
@@ -216,6 +217,7 @@ impl TextSystem {
 
         Self {
             pipeline,
+            atlas_texture,
             atlas_bind_group,
             vertex_buffer: None,
             index_buffer: None,
@@ -223,6 +225,55 @@ impl TextSystem {
             glyph_table,
             font_size,
         }
+    }
+
+    /// Rebuild the glyph atlas with a new font. `font_bytes` is a raw TTF/OTF
+    /// file. On success, rewrites the atlas texture and glyph table in place;
+    /// the caller should mark labels_dirty so the vertex buffer rebuilds with
+    /// the new UVs. Returns false if the font bytes were unparseable.
+    pub fn reload_font(&mut self, queue: &wgpu::Queue, font_bytes: &[u8]) -> bool {
+        let settings = fontdue::FontSettings {
+            collection_index: 0,
+            ..Default::default()
+        };
+        let font = match fontdue::Font::from_bytes(font_bytes.to_vec(), settings) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let (atlas_data, glyph_map) = build_glyph_atlas(&font, self.font_size);
+        let mut new_table: [Option<GlyphInfo>; GLYPH_TABLE_SIZE] = std::array::from_fn(|_| None);
+        for (ch, info) in glyph_map {
+            let idx = ch as u32;
+            if idx >= 32 && idx < 127 {
+                new_table[(idx - 32) as usize] = Some(info);
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ATLAS_SIZE),
+                rows_per_image: Some(ATLAS_SIZE),
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.glyph_table = new_table;
+        true
+    }
+
+    /// Reset to the embedded default font.
+    pub fn reset_font(&mut self, queue: &wgpu::Queue) {
+        self.reload_font(queue, EMBEDDED_FONT);
     }
 
     /// Estimate the world-space collision radius of a label, accounting for zoom.
@@ -309,8 +360,8 @@ impl TextSystem {
         sorted_labels.sort_by_key(|l| match l.kind {
             crate::mapdata::LabelKind::State => 0,
             crate::mapdata::LabelKind::City => 1,
-            crate::mapdata::LabelKind::Subdivision => 2,
-            crate::mapdata::LabelKind::Listing => 3,
+            crate::mapdata::LabelKind::District => 2,
+            crate::mapdata::LabelKind::Marker => 3,
             crate::mapdata::LabelKind::Park => 4,
             crate::mapdata::LabelKind::Street => 5,
             crate::mapdata::LabelKind::Poi => 6,
@@ -326,8 +377,8 @@ impl TextSystem {
             let min_zoom = match label.kind {
                 crate::mapdata::LabelKind::State => -10.0,
                 crate::mapdata::LabelKind::City => -10.0,
-                crate::mapdata::LabelKind::Subdivision => -4.0,
-                crate::mapdata::LabelKind::Listing => -10.0,
+                crate::mapdata::LabelKind::District => -4.0,
+                crate::mapdata::LabelKind::Marker => -10.0,
                 crate::mapdata::LabelKind::Park => -2.0,
                 crate::mapdata::LabelKind::Street => -10.0,
                 crate::mapdata::LabelKind::Building => 0.5,
@@ -337,12 +388,12 @@ impl TextSystem {
                 continue;
             }
 
-            let is_listing = matches!(label.kind, crate::mapdata::LabelKind::Listing);
+            let is_listing = matches!(label.kind, crate::mapdata::LabelKind::Marker);
             let scale = label.font_scale();
             let spacing = label.letter_spacing();
 
             let (label_text_color, label_halo_color) = match label.kind {
-                crate::mapdata::LabelKind::Listing => {
+                crate::mapdata::LabelKind::Marker => {
                     if land_active && land_lum < 0.3 {
                         ([1.0_f32, 1.0, 1.0, 1.0], [0.0_f32, 0.0, 0.0, 0.9])
                     } else {

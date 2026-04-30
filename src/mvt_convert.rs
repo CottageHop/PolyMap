@@ -9,11 +9,16 @@ use crate::mapdata::{
     self, classify_road, expand_polygon,
     generate_fountain, generate_line_geometry, generate_poi_icon,
     is_closed, polygon_centroid, road_width,
-    triangulate_polygon_at_height, Label, LabelKind, MapData, MapVertex, RoadType,
+    decompose_rectilinear, extrude_parapet, generate_tree, generate_tree_shadow,
+    is_approximately_rectangular, oriented_bbox, polygon_perimeter,
+    polygon_signed_area, scatter_trees_in_polygon, triangulate_gable_roof,
+    triangulate_hip_roof, triangulate_skeleton_roof, triangulate_polygon_at_height,
+    Label, LabelKind, MapData, MapVertex, RoadType, FOUNTAIN_MAX_AREA,
+    FOUNTAIN_MIN_CIRCULARITY,
     COLOR_BUILDING, COLOR_COMMERCIAL, COLOR_INDUSTRIAL, COLOR_LAND,
     COLOR_PARK, COLOR_RESIDENTIAL, COLOR_ROAD_MAJOR, COLOR_ROAD_MINOR,
     COLOR_RAIL, COLOR_RAIL_TIE, COLOR_ROAD_OUTLINE, COLOR_SHADOW_CORE, COLOR_SHADOW_EDGE, COLOR_SHADOW_MID, COLOR_SIDEWALK,
-    COLOR_SIDEWALK_OUTLINE, COLOR_SKYSCRAPER, COLOR_WATER, MAT_BUILDING, MAT_BUILDING_WALL,
+    COLOR_SIDEWALK_OUTLINE, COLOR_SKYSCRAPER, COLOR_WATER, MAT_BUILDING, MAT_BUILDING_ROOF_PITCHED, MAT_BUILDING_WALL,
     MAT_COBBLESTONE, MAT_COMMERCIAL, MAT_DEFAULT, MAT_GLASS, MAT_GLASS_WALL, MAT_GRASS,
     MAT_INDUSTRIAL, MAT_RAIL, MAT_RAIL_TIE, MAT_RESIDENTIAL, MAT_ROAD, MAT_WATER,
     SHADOW_BLUR, SHADOW_DIR, Z_LANDUSE, Z_LANDUSE_DETAIL, Z_PARK, Z_PATH_FILL,
@@ -191,7 +196,99 @@ pub fn mvt_to_mapdata(
                 layer, extent, z, x, y, center_lat, center_lon,
                 &mut labels,
             ),
+            // ---- Custom OSM-derived layers (built by parcels/run.sh step_osm) ----
+            "osm_buildings" => process_osm_buildings_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut building_polys,
+            ),
+            "osm_natural_pts" => process_osm_natural_pts_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut tree_positions, &mut labels,
+            ),
+            "osm_amenity_pts" => process_osm_amenity_pts_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut fountain_positions, &mut labels, &mut poi_icons,
+            ),
+            "osm_natural_areas" => process_osm_natural_areas_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut water_polys, &mut park_polys, &mut landuse_polys,
+            ),
+            "osm_recreation" => process_osm_recreation_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut park_polys, &mut water_polys, &mut landuse_polys,
+            ),
+            "osm_historic" => process_osm_named_pts_layer(
+                layer, extent, z, x, y, center_lat, center_lon, "historic",
+                &mut labels, &mut poi_icons,
+            ),
+            "osm_manmade" => process_osm_named_pts_layer(
+                layer, extent, z, x, y, center_lat, center_lon, "man_made",
+                &mut labels, &mut poi_icons,
+            ),
+            "osm_lines" => process_osm_lines_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut tree_positions, &mut water_lines,
+            ),
+            "osm_landuse_detail" => process_osm_landuse_detail_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut landuse_polys, &mut park_polys, &mut tree_positions,
+            ),
+            "osm_places" => process_osm_places_layer(
+                layer, extent, z, x, y, center_lat, center_lon,
+                &mut labels,
+            ),
+            "osm_places_of_worship" => process_osm_named_pts_layer(
+                layer, extent, z, x, y, center_lat, center_lon, "amenity",
+                &mut labels, &mut poi_icons,
+            ),
             _ => {}
+        }
+    }
+
+    // Scatter trees inside park / garden / forest polygons. The Protomaps
+    // pois layer doesn't include individual `natural=tree` nodes (they're
+    // unnamed and filtered from the build), so populate parks procedurally
+    // with deterministic placement seeded by polygon position.
+    //
+    // Density / caps tuned for memory: each tree emits ~90 vertices (after
+    // the per-tree mesh reduction in mapdata.rs::generate_tree), and a single
+    // tile can have many park polygons. We bound per-polygon AND per-tile so
+    // dense parks (Central Park, Prospect Park) don't blow the GPU budget.
+    const TREE_TILE_BUDGET: usize = 250;        // hard cap per tile
+    const TREE_PER_POLY_CAP: usize = 25;        // hard cap per polygon
+    const TREE_DENSITY_DENOM: f32 = 0.10;       // ~1 tree per 110 m² (was 44 m²)
+    for (coords, _name) in &park_polys {
+        if tree_positions.len() >= TREE_TILE_BUDGET {
+            break;
+        }
+        let area = polygon_signed_area(coords).abs();
+        if area < 0.005 {
+            continue;
+        }
+        let remaining_budget = TREE_TILE_BUDGET.saturating_sub(tree_positions.len());
+        let target = ((area / TREE_DENSITY_DENOM) as usize)
+            .clamp(2, TREE_PER_POLY_CAP)
+            .min(remaining_budget);
+        scatter_trees_in_polygon(coords, target, &mut tree_positions);
+    }
+
+    // Detect fountains in the water layer: small + circular water polygons that
+    // weren't tagged as POIs. Same heuristic as the Overpass JSON path.
+    for coords in &water_polys {
+        if coords.len() < 4 {
+            continue;
+        }
+        let area = polygon_signed_area(coords).abs();
+        if area > FOUNTAIN_MAX_AREA {
+            continue;
+        }
+        let perim = polygon_perimeter(coords);
+        if perim < 1e-6 {
+            continue;
+        }
+        let circularity = (4.0 * std::f32::consts::PI * area) / (perim * perim);
+        if circularity >= FOUNTAIN_MIN_CIRCULARITY {
+            fountain_positions.push(mapdata::polygon_centroid(coords));
         }
     }
 
@@ -385,10 +482,81 @@ pub fn mvt_to_mapdata(
                 indices.extend_from_slice(&[base, base+1, base+2, base+1, base+3, base+2]);
             }
         }
-        triangulate_polygon_at_height(
-            &render_coords, effective_height, color, roof_mat,
-            &mut vertices, &mut indices,
-        );
+        // SPIKE: hip-style pitched roof for buildings ≤ 15m tall (houses, low-rise).
+        // Polygon-driven (always matches walls). Ridge rise temporarily exaggerated
+        // to equal the wall height so the pitch is unmistakable during validation.
+        // Architectural-rules pitched roof:
+        //   - Skip tall buildings (mid/high-rises don't get gables in real life).
+        //   - Skip large-footprint buildings (commercial/institutional complexes).
+        //   - Skip irregular footprints (L-shapes, multipolygon parts) — proper
+        //     gable requires a near-rectangular outline (straight-skeleton
+        //     algorithm would handle the rest, future work).
+        //   - Apply a real gable on the OBB for small rectangular homes.
+        const ROOF_HEIGHT_MAX: f32 = 12.0;          // meters — keeps default-height residential, drops mid-rise
+        const ROOF_HEIGHT_MIN: f32 = 4.0;           // meters — drops sheds/awnings
+        const ROOF_AREA_MAX: f32 = 4.0;             // world units² ≈ 493 m² (≈ generous single-family)
+        const ROOF_RECT_THRESHOLD: f32 = 0.85;      // polygon area / OBB area
+        const ROOF_MAX_VERTICES: usize = 8;         // simple footprints only
+
+        let area = polygon_signed_area(&render_coords).abs();
+        let is_small_home = *height >= ROOF_HEIGHT_MIN
+            && *height <= ROOF_HEIGHT_MAX
+            && render_coords.len() >= 4
+            && render_coords.len() <= ROOF_MAX_VERTICES + 1
+            && area <= ROOF_AREA_MAX;
+
+        if is_small_home {
+            if is_approximately_rectangular(&render_coords, ROOF_RECT_THRESHOLD) {
+                // Clean rectangle → single gable along the long axis.
+                let (_, _, _, half_short) = oriented_bbox(&render_coords);
+                let ridge_rise = (half_short * 0.55).max(0.18);
+                triangulate_gable_roof(
+                    &render_coords, effective_height, effective_height + ridge_rise,
+                    color, MAT_BUILDING_ROOF_PITCHED,
+                    &mut vertices, &mut indices,
+                );
+            } else if let Some(rects) = decompose_rectilinear(&render_coords) {
+                // L/T-shape → decompose into rectangles, gable each on its own
+                // long axis. Each rectangle's ridge height = its own short axis,
+                // so the smaller wing's ridge butts into the main rectangle's slope.
+                for rect in &rects {
+                    let (_, _, _, hs) = oriented_bbox(rect);
+                    let rr = (hs * 0.55).max(0.18);
+                    triangulate_gable_roof(
+                        rect, effective_height, effective_height + rr,
+                        color, MAT_BUILDING_ROOF_PITCHED,
+                        &mut vertices, &mut indices,
+                    );
+                }
+            } else {
+                // Non-rectilinear (rotated/curved) small footprint → straight-skeleton.
+                let (_, _, _, hs) = oriented_bbox(&render_coords);
+                let rr = (hs * 0.55).max(0.18);
+                triangulate_skeleton_roof(
+                    &render_coords, effective_height, effective_height + rr,
+                    color, MAT_BUILDING_ROOF_PITCHED,
+                    &mut vertices, &mut indices,
+                );
+            }
+        } else {
+            // No pitched roof for this building (tall, large, or too complex).
+            // Add a thick parapet wall above the existing wall top so the flat
+            // roof appears slightly sunken inside the perimeter. Height ~12% of
+            // wall height, clamped to [3m, 9m]. Thickness ~1.1m gives a visibly
+            // chunky top rim from above.
+            let parapet_h = (effective_height * 0.12).clamp(0.27, 0.8);
+            let parapet_thickness = 0.10; // ~1.1 m world
+            let parapet_top = effective_height + parapet_h;
+            extrude_parapet(
+                &render_coords, effective_height, parapet_top, parapet_thickness,
+                color, wall_mat,
+                &mut vertices, &mut indices,
+            );
+            triangulate_polygon_at_height(
+                &render_coords, effective_height, color, roof_mat,
+                &mut vertices, &mut indices,
+            );
+        }
 
         // Building label
         if let Some(name) = name {
@@ -638,6 +806,14 @@ pub fn mvt_to_mapdata(
         generate_fountain(*pos, Z_WATER, &mut vertices, &mut indices);
     }
 
+    // Layer 11: Trees (placed at OSM `natural=tree` node positions from the pois layer).
+    for pos in &tree_positions {
+        generate_tree_shadow(*pos, &mut shadow_vertices, &mut shadow_indices);
+    }
+    for pos in &tree_positions {
+        generate_tree(*pos, &mut vertices, &mut indices);
+    }
+
 
     // No hard vertex cap — using queue.write_buffer avoids mappedAtCreation limits.
     // Building budget (80K verts) prevents unbounded growth in dense tiles.
@@ -698,14 +874,52 @@ pub fn mvt_to_mapdata(
         }
     }
 
+    // Noise heat-map sources. Sample point features along line geometry at a
+    // coarse spacing — enough to cover the road/rail but not so dense we
+    // over-saturate the 128-slot GPU budget.
+    let mut noise_sources: Vec<crate::mapdata::NoiseSource> = Vec::new();
+    let sample_line = |coords: &[[f32; 2]], spacing: f32, db: f32, out: &mut Vec<crate::mapdata::NoiseSource>| {
+        if coords.len() < 2 { return; }
+        let mut walked = 0.0_f32;
+        let mut next_at = spacing * 0.5;
+        for i in 0..coords.len() - 1 {
+            let dx = coords[i + 1][0] - coords[i][0];
+            let dy = coords[i + 1][1] - coords[i][1];
+            let seg_len = (dx * dx + dy * dy).sqrt();
+            if seg_len < 1e-6 { continue; }
+            while walked + seg_len >= next_at {
+                let t = (next_at - walked) / seg_len;
+                let pos = [coords[i][0] + dx * t, coords[i][1] + dy * t];
+                out.push(crate::mapdata::NoiseSource { pos, db, _pad: 0.0 });
+                next_at += spacing;
+            }
+            walked += seg_len;
+        }
+    };
+    for (coords, road_type, _) in &road_lines {
+        let (spacing, db) = match road_type {
+            RoadType::Major => (60.0_f32, 72.0_f32),
+            RoadType::Minor | RoadType::Residential => (90.0, 58.0),
+            RoadType::Rail => (45.0, 85.0),
+            RoadType::Path => continue,
+        };
+        sample_line(coords, spacing, db, &mut noise_sources);
+    }
+    for (coords, _) in &park_polys {
+        if coords.len() >= 3 {
+            let c = polygon_centroid(coords);
+            noise_sources.push(crate::mapdata::NoiseSource { pos: c, db: 55.0, _pad: 0.0 });
+        }
+    }
+
     MapData {
         vertices,
         indices,
         shadow_vertices,
         shadow_indices,
         labels,
-        listings: Vec::new(),
         cars,
+        noise_sources,
         center_lat,
         center_lon,
     }
@@ -935,7 +1149,7 @@ fn process_pois_layer(
 
                 match kind {
                     "fountain" => fountain_positions.push(pos),
-                    "tree" => {}
+                    "tree" => tree_positions.push(pos),
                     _ => {
                         // Create label and 3D icon for named POIs
                         if let Some(name) = feature.get_str(layer, "name") {
@@ -997,5 +1211,468 @@ fn process_places_layer(
                 });
             }
         }
+    }
+}
+
+// ===========================================================================
+// OSM-derived layer handlers (consume tiles built by parcels/run.sh step_osm).
+// These layers carry RAW OSM tag names as feature properties (`natural`,
+// `amenity`, `building`, `historic`, `man_made`, `landuse`, `place`, …),
+// not Protomaps' normalized `kind` field. They feed into the same buckets as
+// the basemap layers so the downstream render code is unchanged.
+// ===========================================================================
+
+/// `osm_buildings`: polygon features tagged `building=*` plus optional
+/// `building:levels`, `height`, `roof:shape`, `name`, `addr:*`, etc. We populate
+/// the same `building_polys` bucket the basemap path uses; if both layers are
+/// present in a tile, buildings will render twice — turn off Protomaps'
+/// `buildings` layer in the source pmtiles for clean output.
+fn process_osm_buildings_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    building_polys: &mut Vec<(Vec<[f32; 2]>, Option<String>, f32, Vec<bool>)>,
+) {
+    for feature in &layer.features {
+        if feature.geom_type != GeomType::Polygon {
+            continue;
+        }
+        // Height: explicit `height`, else `building:levels` × 3.2 m, else 8 m.
+        let height = feature
+            .get_f64(layer, "height")
+            .or_else(|| feature.get_f64(layer, "building:levels").map(|l| l * 3.2))
+            .unwrap_or(8.0) as f32;
+        let name = feature.get_str(layer, "name").map(|s| s.to_string());
+        for ring in &feature.geometry {
+            if ring.len() < 3 {
+                continue;
+            }
+            if centroid_outside_tile(ring, extent) {
+                continue;
+            }
+            let coords = convert_ring(ring, extent, z, x, y, center_lat, center_lon);
+            if coords.len() < 4 || !mapdata::is_closed(&coords) {
+                continue;
+            }
+            let mask: Vec<bool> = (0..ring.len().saturating_sub(1))
+                .map(|i| is_tile_boundary_edge(ring[i], ring[i + 1], extent))
+                .collect();
+            building_polys.push((coords, name.clone(), height, mask));
+        }
+    }
+}
+
+/// `osm_natural_pts`: nodes tagged `natural=tree|peak|spring|stone|...`. Trees
+/// feed `tree_positions`; named features (peaks, springs) emit a label.
+fn process_osm_natural_pts_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    tree_positions: &mut Vec<[f32; 2]>,
+    labels: &mut Vec<Label>,
+) {
+    for feature in &layer.features {
+        if feature.geom_type != GeomType::Point {
+            continue;
+        }
+        let kind = feature.get_str(layer, "natural").unwrap_or("");
+        let pos = match feature_first_pos(feature, extent, z, x, y, center_lat, center_lon) {
+            Some(p) => p,
+            None => continue,
+        };
+        match kind {
+            "tree" => tree_positions.push(pos),
+            _ => {
+                if let Some(name) = feature.get_str(layer, "name") {
+                    if !name.is_empty() {
+                        labels.push(Label {
+                            text: name.to_string(),
+                            position: pos,
+                            angle: 0.0,
+                            kind: LabelKind::Poi,
+                            path: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `osm_amenity_pts`: nodes/ways tagged `amenity=fountain|bench|parking|…`.
+/// Fountains feed `fountain_positions`; named amenities emit label + icon.
+fn process_osm_amenity_pts_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    fountain_positions: &mut Vec<[f32; 2]>,
+    labels: &mut Vec<Label>,
+    poi_icons: &mut Vec<([f32; 2], String)>,
+) {
+    for feature in &layer.features {
+        let kind = feature.get_str(layer, "amenity").unwrap_or("").to_string();
+        let pos = match feature_first_pos(feature, extent, z, x, y, center_lat, center_lon) {
+            Some(p) => p,
+            None => continue,
+        };
+        match kind.as_str() {
+            "fountain" => fountain_positions.push(pos),
+            "" => {}
+            _ => {
+                if let Some(name) = feature.get_str(layer, "name") {
+                    if !name.is_empty() {
+                        labels.push(Label {
+                            text: name.to_string(),
+                            position: pos,
+                            angle: 0.0,
+                            kind: LabelKind::Poi,
+                            path: None,
+                        });
+                        poi_icons.push((pos, kind));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `osm_natural_areas`: polygons tagged `natural=water|wood|scrub|wetland|…`.
+fn process_osm_natural_areas_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    water_polys: &mut Vec<Vec<[f32; 2]>>,
+    park_polys: &mut Vec<(Vec<[f32; 2]>, Option<String>)>,
+    landuse_polys: &mut Vec<(Vec<[f32; 2]>, [f32; 4], f32, f32)>,
+) {
+    for feature in &layer.features {
+        if feature.geom_type != GeomType::Polygon {
+            continue;
+        }
+        let kind = feature.get_str(layer, "natural").unwrap_or("");
+        let name = feature.get_str(layer, "name").map(|s| s.to_string());
+        for ring in &feature.geometry {
+            if ring.len() < 3 {
+                continue;
+            }
+            let coords = convert_ring(ring, extent, z, x, y, center_lat, center_lon);
+            if coords.len() < 4 || !mapdata::is_closed(&coords) {
+                continue;
+            }
+            match kind {
+                "water" => water_polys.push(coords),
+                "wood" | "scrub" | "heath" | "grassland" => {
+                    park_polys.push((coords, name.clone()))
+                }
+                "beach" | "sand" => {
+                    landuse_polys.push((coords, [0.96, 0.91, 0.78, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                "bare_rock" | "scree" => {
+                    landuse_polys.push((coords, [0.72, 0.70, 0.66, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                "wetland" => {
+                    landuse_polys.push((coords, [0.66, 0.78, 0.74, 1.0], MAT_GRASS, Z_LANDUSE))
+                }
+                "glacier" => {
+                    landuse_polys.push((coords, [0.92, 0.95, 0.97, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `osm_recreation`: polygons (and a few points) tagged `leisure=park|playground|pitch|…`.
+fn process_osm_recreation_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    park_polys: &mut Vec<(Vec<[f32; 2]>, Option<String>)>,
+    water_polys: &mut Vec<Vec<[f32; 2]>>,
+    landuse_polys: &mut Vec<(Vec<[f32; 2]>, [f32; 4], f32, f32)>,
+) {
+    for feature in &layer.features {
+        if feature.geom_type != GeomType::Polygon {
+            continue;
+        }
+        let kind = feature.get_str(layer, "leisure").unwrap_or("");
+        let name = feature.get_str(layer, "name").map(|s| s.to_string());
+        for ring in &feature.geometry {
+            if ring.len() < 3 {
+                continue;
+            }
+            let coords = convert_ring(ring, extent, z, x, y, center_lat, center_lon);
+            if coords.len() < 4 || !mapdata::is_closed(&coords) {
+                continue;
+            }
+            match kind {
+                "park" | "garden" | "playground" | "dog_park" | "nature_reserve" | "golf_course" => {
+                    park_polys.push((coords, name.clone()))
+                }
+                "swimming_pool" => water_polys.push(coords),
+                "pitch" | "track" => {
+                    landuse_polys.push((coords, [0.78, 0.85, 0.74, 1.0], MAT_GRASS, Z_LANDUSE))
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Generic handler for point/polygon features whose kind comes from a single
+/// configured tag key (used for `osm_historic`, `osm_manmade`,
+/// `osm_places_of_worship`). Emits a label + POI icon at the feature centroid
+/// for any named feature; drops unnamed.
+fn process_osm_named_pts_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    kind_key: &str,
+    labels: &mut Vec<Label>,
+    poi_icons: &mut Vec<([f32; 2], String)>,
+) {
+    for feature in &layer.features {
+        let kind = feature.get_str(layer, kind_key).unwrap_or("").to_string();
+        if kind.is_empty() {
+            continue;
+        }
+        let name = match feature.get_str(layer, "name") {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let pos = match feature_first_pos(feature, extent, z, x, y, center_lat, center_lon) {
+            Some(p) => p,
+            None => continue,
+        };
+        labels.push(Label {
+            text: name,
+            position: pos,
+            angle: 0.0,
+            kind: LabelKind::Poi,
+            path: None,
+        });
+        poi_icons.push((pos, kind));
+    }
+}
+
+/// `osm_lines`: linear features (waterways, tree_row, hedges, cliffs).
+/// Tree rows scatter trees along their length; waterways feed `water_lines`.
+fn process_osm_lines_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    tree_positions: &mut Vec<[f32; 2]>,
+    water_lines: &mut Vec<(Vec<[f32; 2]>, f32)>,
+) {
+    for feature in &layer.features {
+        if feature.geom_type != GeomType::LineString {
+            continue;
+        }
+        let natural = feature.get_str(layer, "natural").unwrap_or("");
+        let waterway = feature.get_str(layer, "waterway").unwrap_or("");
+        for line in &feature.geometry {
+            let coords = convert_ring(line, extent, z, x, y, center_lat, center_lon);
+            if coords.len() < 2 {
+                continue;
+            }
+            match (natural, waterway) {
+                ("tree_row", _) => scatter_trees_along_line(&coords, 0.06, tree_positions),
+                (_, "river") => water_lines.push((coords, 3.0)),
+                (_, "canal") => water_lines.push((coords, 1.8)),
+                (_, "stream") => water_lines.push((coords, 0.6)),
+                (_, "ditch") | (_, "drain") => water_lines.push((coords, 0.4)),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `osm_landuse_detail`: polygon features tagged `landuse=cemetery|orchard|…`.
+/// Most go straight to `landuse_polys` with a chosen color. `orchard` and
+/// `vineyard` additionally scatter trees inside (orchards are literally rows
+/// of trees, so visible greenery is appropriate).
+fn process_osm_landuse_detail_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    landuse_polys: &mut Vec<(Vec<[f32; 2]>, [f32; 4], f32, f32)>,
+    park_polys: &mut Vec<(Vec<[f32; 2]>, Option<String>)>,
+    tree_positions: &mut Vec<[f32; 2]>,
+) {
+    for feature in &layer.features {
+        if feature.geom_type != GeomType::Polygon {
+            continue;
+        }
+        let kind = feature.get_str(layer, "landuse").unwrap_or("");
+        let name = feature.get_str(layer, "name").map(|s| s.to_string());
+        for ring in &feature.geometry {
+            if ring.len() < 3 {
+                continue;
+            }
+            let coords = convert_ring(ring, extent, z, x, y, center_lat, center_lon);
+            if coords.len() < 4 || !mapdata::is_closed(&coords) {
+                continue;
+            }
+            match kind {
+                "cemetery" => park_polys.push((coords, name.clone())),
+                "orchard" => {
+                    // Orchards are just dense park polys; let the post-layer
+                    // scatter handle them under the per-tile tree budget.
+                    park_polys.push((coords, name.clone()));
+                }
+                "vineyard" => {
+                    landuse_polys.push((coords, [0.78, 0.74, 0.55, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                "farmland" => {
+                    landuse_polys.push((coords, [0.92, 0.93, 0.78, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                "allotments" | "village_green" | "recreation_ground" | "greenfield" => {
+                    park_polys.push((coords, name.clone()))
+                }
+                "quarry" => {
+                    landuse_polys.push((coords, [0.65, 0.62, 0.58, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                "brownfield" => {
+                    landuse_polys.push((coords, [0.74, 0.70, 0.62, 1.0], MAT_DEFAULT, Z_LANDUSE))
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `osm_places`: city/town/village/neighbourhood points → `City` and `Park`-kind
+/// labels (Park kind is reused as a smaller label class for sub-city places).
+fn process_osm_places_layer(
+    layer: &Layer,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+    labels: &mut Vec<Label>,
+) {
+    for feature in &layer.features {
+        let kind = feature.get_str(layer, "place").unwrap_or("");
+        let name = match feature.get_str(layer, "name") {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let pos = match feature_first_pos(feature, extent, z, x, y, center_lat, center_lon) {
+            Some(p) => p,
+            None => continue,
+        };
+        let label_kind = match kind {
+            "city" | "town" => LabelKind::City,
+            "village" | "hamlet" | "suburb" | "neighbourhood" => LabelKind::Park,
+            _ => continue,
+        };
+        labels.push(Label {
+            text: name,
+            position: pos,
+            angle: 0.0,
+            kind: label_kind,
+            path: None,
+        });
+    }
+}
+
+// --- helpers shared by OSM handlers ----------------------------------------
+
+/// Extract the first point of a feature's first ring, project to world space,
+/// or return None if the feature is empty / centroid is outside the tile.
+fn feature_first_pos(
+    feature: &crate::mvt::Feature,
+    extent: u32,
+    z: u8,
+    x: u32,
+    y: u32,
+    center_lat: f64,
+    center_lon: f64,
+) -> Option<[f32; 2]> {
+    let ring = feature.geometry.first()?;
+    let pt = ring.first().copied()?;
+    if centroid_outside_tile(&[pt], extent) {
+        return None;
+    }
+    let (lat, lon) = tile_to_latlon(pt[0], pt[1], extent, z, x, y);
+    Some(mapdata::project(lat, lon, center_lat, center_lon))
+}
+
+/// Place trees at `interval` world-unit spacing along a polyline, with small
+/// deterministic perpendicular jitter so a tree row doesn't look ruler-straight.
+fn scatter_trees_along_line(
+    coords: &[[f32; 2]],
+    interval: f32,
+    tree_positions: &mut Vec<[f32; 2]>,
+) {
+    if coords.len() < 2 || interval < 1e-6 {
+        return;
+    }
+    // Seed jitter from the first vertex.
+    let p0 = coords[0];
+    let mut state: u32 =
+        (p0[0] * 73856093.0_f32).to_bits() ^ (p0[1] * 19349663.0_f32).to_bits() ^ 0x9E3779B9;
+    let mut next_jitter = || -> f32 {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (((state >> 8) & 0x00FFFFFF) as f32 / 16_777_216.0 - 0.5) * 0.4 * interval
+    };
+    let mut walked = 0.0f32;
+    let mut next_at = interval * 0.5;
+    for i in 0..coords.len() - 1 {
+        let a = coords[i];
+        let b = coords[i + 1];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let seg_len = (dx * dx + dy * dy).sqrt();
+        if seg_len < 1e-8 {
+            continue;
+        }
+        let nx = -dy / seg_len;
+        let ny = dx / seg_len;
+        while walked + seg_len >= next_at {
+            let t = (next_at - walked) / seg_len;
+            let jx = next_jitter();
+            let py = next_jitter();
+            tree_positions.push([
+                a[0] + dx * t + nx * jx,
+                a[1] + dy * t + ny * py,
+            ]);
+            next_at += interval;
+        }
+        walked += seg_len;
     }
 }

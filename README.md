@@ -4,6 +4,11 @@
 
 A 3D map renderer powered by WebGPU and Rust/WASM. Renders OpenStreetMap data as textured 3D geometry with buildings, roads, parks, water, trees, and labels — directly in the browser.
 
+**🚀 Live demo:** [cottagehop.github.io/PolyMap](https://cottagehop.github.io/PolyMap/)
+*(activated by `.github/workflows/deploy-demo.yml`. To enable: GitHub repo → Settings → Pages → Source = **GitHub Actions**.)*
+
+**Run locally:** `make serve` — then open <http://localhost:8080>.
+
 ## Features
 
 - **WebGPU + WebGL2 fallback** — hardware-accelerated 3D map with materials and shadows, works in Chrome, Firefox, and Safari

@@ -1,22 +1,11 @@
 use crate::gpu::GpuState;
+use crate::mapdata::NoiseSource;
 use wgpu::util::DeviceExt;
 
 /// Maximum noise sources uploaded per frame. Keeps the uniform buffer size
 /// under WebGPU's 64 KB uniform limit (128 × 16 = 2 KB). For more sources
-/// we'd spatial-cull on the CPU and only upload the 128 most relevant.
+/// we spatial-cull on the CPU and only upload the 128 most relevant.
 pub const MAX_NOISE_SOURCES: usize = 128;
-
-/// A point noise source. Line sources (roads, rails) should be sampled by the
-/// host into multiple points along the polyline at spawn time.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct NoiseSource {
-    pub pos: [f32; 2],
-    /// Decibels at 1 world-unit distance. The fragment shader applies
-    /// inverse-square falloff from there.
-    pub db: f32,
-    pub _pad: f32,
-}
 
 /// Matches `NoiseUniform` in noise.wgsl: u32 count + 3 × u32 pad + N sources.
 #[repr(C)]

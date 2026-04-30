@@ -76,11 +76,21 @@ pub fn clear_rendered_z14() {
 /// Tile size in degrees (~1.1km per tile).
 pub const TILE_SIZE: f64 = 0.01;
 
-/// Maximum number of tiles kept in memory.
-const MAX_TILES: usize = 128;
+/// Maximum number of tiles whose GPU buffers (vertex/index/shadow) are
+/// retained simultaneously. Each loaded tile holds several wgpu::Buffer
+/// allocations totaling ~3-5 MB depending on density; 32 tiles ≈ 100-160 MB
+/// of GPU memory at the high end. Beyond that, Safari starts hitting its
+/// per-tab memory ceiling.
+///
+/// Eviction is LRU on `last_visible_frame`. Re-entering a previously-evicted
+/// tile is cheap because the decoded `MapData` is still cached on the CPU
+/// side (`MAPDATA_CACHE`, 64 entries) — we just rebuild the GPU buffers
+/// without re-fetching or re-decoding.
+const MAX_TILES: usize = 32;
 
-/// Maximum concurrent tile fetches.
-const MAX_IN_FLIGHT: usize = 8;
+/// Maximum concurrent tile fetches. Lower = less peak memory during pan
+/// (fewer simultaneous decodes), slightly slower fill-in.
+const MAX_IN_FLIGHT: usize = 6;
 
 /// Minimum seconds between tile fetch requests.
 const FETCH_INTERVAL: f64 = 0.01;
@@ -140,6 +150,7 @@ pub struct LoadedTile {
     pub num_shadow_indices: u32,
     pub labels: Vec<Label>,
     pub cars: Vec<crate::mapdata::Car>,
+    pub noise_sources: Vec<crate::mapdata::NoiseSource>,
     pub last_visible_frame: u64,
     /// z14 MVT tile coordinates — used for dedup in rendering
     pub z14_tile: (u32, u32),
@@ -183,6 +194,7 @@ impl LoadedTile {
             num_shadow_indices: num_shadow,
             labels: data.labels.clone(),
             cars: data.cars.clone(),
+            noise_sources: data.noise_sources.clone(),
             last_visible_frame: 0,
             z14_tile,
         }
@@ -802,7 +814,7 @@ async fn fetch_tile_wasm(
             base, south, west, north, east
         );
 
-        let body = crate::wasm_fetch_text(&api_url, "GET", None, None)
+        let body = crate::app::wasm_fetch_text(&api_url, "GET", None, None)
             .await
             .ok_or("API fetch failed")?;
 

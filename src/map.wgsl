@@ -1,5 +1,5 @@
 // PolyMap — 3D Procedurally Textured Map Shader
-// Materials: 0=default, 1=asphalt, 2=building roof, 3=grass, 4=water, 5=building wall, 6=tree leaves, 7=tree trunk, 8=cobblestone, 9=glass roof, 10=glass wall, 11=fountain
+// Materials: 0=default, 1=asphalt, 2=building roof, 3=grass, 4=water, 5=building wall, 6=tree leaves, 7=tree trunk, 8=cobblestone, 9=glass roof, 10=glass wall, 11=fountain, 19=pitched roof shingles
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -259,11 +259,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let orig_lum = dot(color, vec3<f32>(0.299, 0.587, 0.114));
     let is_water = mat == 4 || mat == 11;
     let is_park = mat == 3 || mat == 6;
-    let is_building = mat == 2 || mat == 5 || mat == 9 || mat == 10;
+    let is_building = mat == 2 || mat == 5 || mat == 9 || mat == 10 || mat == 19;
     let is_road = mat == 1 || mat == 8;
     let is_rail = mat == 17 || mat == 18; // MAT_RAIL | MAT_RAIL_TIE
     let is_land = !is_water && !is_park && !is_building && !is_road && !is_rail
-                  && mat != 12 && mat != 13; // exclude clouds and pins
+                  && mat != 12; // exclude clouds
 
     if camera.rail_tint.a > 0.5 && is_rail {
         // Ties auto-darken to ~0.7× of the picked rail color so the
@@ -279,7 +279,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = camera.park_tint.rgb;
     } else if camera.building_tint.a > 0.5 && is_building {
         let tint = camera.building_tint.rgb;
-        if mat == 5 || mat == 10 {
+        // Mat 5/10 (walls) and 19 (pitched-roof slopes) carry baked per-face
+        // shading in the vertex color. Preserve relative luminance so the
+        // dashboard tint colors the building without flattening the shading.
+        if mat == 5 || mat == 10 || mat == 19 {
             let tint_lum = max(dot(tint, vec3<f32>(0.299, 0.587, 0.114)), 0.01);
             color = tint * (orig_lum / tint_lum);
         } else {
@@ -396,10 +399,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let stone = noise2(uv * 2.0) * 0.04;
             color = color + vec3<f32>(stone);
         }
-        case 13: {
-            // Pin marker — glossy with subtle highlight
-            let highlight = smoothstep(0.3, 0.7, in.world_pos.z / 0.5) * 0.15;
-            color = color + vec3<f32>(highlight);
+        case 19: {
+            // Pitched roof — shingle/seam pattern keyed off world-space height
+            // so courses run horizontally on the slope. Vertex color carries
+            // per-face shading from triangulate_hip_roof.
+            let row = floor(in.world_pos.z * 80.0);
+            let row_offset = fract(row * 0.5);
+            let across = in.world_pos.x + in.world_pos.y;
+            let stagger = fract(across * 12.0 + row_offset);
+            let course = smoothstep(0.0, 0.05, fract(in.world_pos.z * 80.0))
+                       * smoothstep(0.0, 0.05, 1.0 - fract(in.world_pos.z * 80.0));
+            let seam = smoothstep(0.0, 0.04, stagger) * smoothstep(0.0, 0.04, 1.0 - stagger);
+            let shingle = mix(-0.06, 0.02, course * seam);
+            let weather = noise2(in.world_pos.xy * 30.0) * 0.04;
+            color = color + vec3<f32>(shingle + weather);
         }
         default: {
             let subtle = noise2(in.world_pos.xy * 20.0) * 0.015;

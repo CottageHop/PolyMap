@@ -23,6 +23,10 @@ pub enum Command {
     /// Host should convert sources' dB to the "dB at 1 world unit" convention
     /// the shader expects — or we can document a simple lookup table.
     SetNoiseSources(Vec<(f64, f64, f32)>),
+    /// Replace the label font with the given raw TTF/OTF bytes.
+    SetFont(Vec<u8>),
+    /// Revert to the embedded default font.
+    ResetFont,
     LoadBbox { south: f64, west: f64, north: f64, east: f64 },
     UploadBackgroundTexture {
         width: u32,
@@ -49,6 +53,8 @@ pub enum Command {
         shadow_indices: Vec<u32>,
         labels_json: String,
         z14_tile: String,
+        /// Noise heat-map sources. 4 floats per source: x, y, db, pad.
+        noise_sources: Vec<f32>,
     },
     TileFailed {
         col: i32,
@@ -310,6 +316,19 @@ impl PolyMap {
         push_command(Command::SetNoiseSources(parsed));
     }
 
+    /// Replace the label font. Accepts raw TTF/OTF bytes as a Uint8Array.
+    /// The atlas is rebuilt and labels will re-lay out on the next frame.
+    #[wasm_bindgen(js_name = setFont)]
+    pub fn set_font(&self, bytes: &js_sys::Uint8Array) {
+        push_command(Command::SetFont(bytes.to_vec()));
+    }
+
+    /// Revert the label font to the embedded default.
+    #[wasm_bindgen(js_name = resetFont)]
+    pub fn reset_font(&self) {
+        push_command(Command::ResetFont);
+    }
+
     // ── Events ────────────────────────────────────────────────────────
 
     /// Register an event callback. Events: "ready", "camera:move", "click", "resize".
@@ -349,7 +368,11 @@ impl PolyMap {
         shadow_indices: &js_sys::Uint32Array,
         labels_json: &str,
         z14_tile: &str,
+        noise_sources: Option<js_sys::Float32Array>,
     ) {
+        let noise_vec: Vec<f32> = noise_sources
+            .map(|n| n.to_vec())
+            .unwrap_or_default();
         push_command(Command::UploadTile {
             col,
             row,
@@ -359,6 +382,7 @@ impl PolyMap {
             shadow_indices: shadow_indices.to_vec(),
             labels_json: labels_json.to_string(),
             z14_tile: z14_tile.to_string(),
+            noise_sources: noise_vec,
         });
     }
 

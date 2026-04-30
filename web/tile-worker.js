@@ -57,6 +57,7 @@ async function processJob(mod, job) {
     const indices = result.indices;
     const shadowVertices = result.shadowVertices;
     const shadowIndices = result.shadowIndices;
+    const noiseSources = result.noiseSources;
     const labels = result.labels || '[]';
     const z14Tile = result.z14Tile || '0,0';
 
@@ -65,6 +66,7 @@ async function processJob(mod, job) {
     if (indices?.buffer) transfer.push(indices.buffer);
     if (shadowVertices?.buffer) transfer.push(shadowVertices.buffer);
     if (shadowIndices?.buffer) transfer.push(shadowIndices.buffer);
+    if (noiseSources?.buffer) transfer.push(noiseSources.buffer);
 
     self.postMessage({
       type: 'result',
@@ -73,6 +75,7 @@ async function processJob(mod, job) {
       indices,
       shadowVertices,
       shadowIndices,
+      noiseSources,
       labels,
       z14Tile,
     }, transfer);

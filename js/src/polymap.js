@@ -125,7 +125,7 @@ export async function createPolyMap(container, options = {}) {
     const w = new Worker('/polymap/tile-worker.js', { type: 'module' });
     w.busy = false;
     w.onmessage = (e) => {
-      const { type, id, error, empty, vertices, indices, shadowVertices, shadowIndices, labels, z14Tile } = e.data;
+      const { type, id, error, empty, vertices, indices, shadowVertices, shadowIndices, noiseSources, labels, z14Tile } = e.data;
       if (type === 'ready') return;
       if (type === 'error') {
         console.warn('[PolyMap Worker] Error:', error);
@@ -144,6 +144,7 @@ export async function createPolyMap(container, options = {}) {
           new Uint32Array(shadowIndices?.buffer || shadowIndices || []),
           labels || '[]',
           z14Tile || '0,0',
+          noiseSources ? new Float32Array(noiseSources.buffer || noiseSources) : undefined,
         );
       } else if (tile) {
         // Empty or failed — release the in-flight slot

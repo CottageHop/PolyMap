@@ -1,0 +1,65 @@
+name: Deploy demo to GitHub Pages
+
+# Builds the WASM, downloads a small NYC tile sample, and publishes the demo
+# at https://cottagehop.github.io/PolyMap/.
+#
+# To enable: GitHub repo → Settings → Pages → Source = "GitHub Actions".
+# After that, every push to `main` redeploys.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pmtiles CLI
+        run: |
+          curl -sL https://github.com/protomaps/go-pmtiles/releases/download/v1.30.1/go-pmtiles_1.30.1_Linux_x86_64.tar.gz \
+            | tar xz -C /usr/local/bin pmtiles
+
+      - name: Build both WASMs
+        run: make build-web
+
+      - name: Download a small demo tile sample (NYC)
+        run: make download-tiles
+
+      - name: Upload demo artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
