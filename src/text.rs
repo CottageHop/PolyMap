@@ -28,6 +28,7 @@ const GLYPH_TABLE_SIZE: usize = 95; // 127 - 32
 /// The text rendering system: glyph atlas + GPU pipeline.
 pub struct TextSystem {
     pipeline: wgpu::RenderPipeline,
+    atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
     vertex_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
@@ -216,6 +217,7 @@ impl TextSystem {
 
         Self {
             pipeline,
+            atlas_texture,
             atlas_bind_group,
             vertex_buffer: None,
             index_buffer: None,
@@ -223,6 +225,55 @@ impl TextSystem {
             glyph_table,
             font_size,
         }
+    }
+
+    /// Rebuild the glyph atlas with a new font. `font_bytes` is a raw TTF/OTF
+    /// file. On success, rewrites the atlas texture and glyph table in place;
+    /// the caller should mark labels_dirty so the vertex buffer rebuilds with
+    /// the new UVs. Returns false if the font bytes were unparseable.
+    pub fn reload_font(&mut self, queue: &wgpu::Queue, font_bytes: &[u8]) -> bool {
+        let settings = fontdue::FontSettings {
+            collection_index: 0,
+            ..Default::default()
+        };
+        let font = match fontdue::Font::from_bytes(font_bytes.to_vec(), settings) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let (atlas_data, glyph_map) = build_glyph_atlas(&font, self.font_size);
+        let mut new_table: [Option<GlyphInfo>; GLYPH_TABLE_SIZE] = std::array::from_fn(|_| None);
+        for (ch, info) in glyph_map {
+            let idx = ch as u32;
+            if idx >= 32 && idx < 127 {
+                new_table[(idx - 32) as usize] = Some(info);
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ATLAS_SIZE),
+                rows_per_image: Some(ATLAS_SIZE),
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.glyph_table = new_table;
+        true
+    }
+
+    /// Reset to the embedded default font.
+    pub fn reset_font(&mut self, queue: &wgpu::Queue) {
+        self.reload_font(queue, EMBEDDED_FONT);
     }
 
     /// Estimate the world-space collision radius of a label, accounting for zoom.
@@ -244,11 +295,11 @@ impl TextSystem {
 
     /// Generate text quads for all labels and upload to GPU.
     pub fn upload_labels(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label]) {
-        self.upload_labels_at_zoom(device, queue, labels, 1.0);
+        self.upload_labels_at_zoom(device, queue, labels, 1.0, 1000.0);
     }
 
-    pub fn upload_labels_at_zoom(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label], zoom: f32) {
-        self.upload_labels_themed(device, queue, labels, zoom, [0.0; 4], [0.0; 4]);
+    pub fn upload_labels_at_zoom(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, labels: &[Label], zoom: f32, viewport_min: f32) {
+        self.upload_labels_themed(device, queue, labels, zoom, [0.0; 4], [0.0; 4], viewport_min);
     }
 
     pub fn upload_labels_themed(
@@ -259,6 +310,7 @@ impl TextSystem {
         zoom: f32,
         road_tint: [f32; 4],
         land_tint: [f32; 4],
+        viewport_min: f32,
     ) {
         let mut vertices: Vec<TextVertex> = Vec::with_capacity(256 * 20);
         let mut indices: Vec<u32> = Vec::with_capacity(256 * 30);
@@ -286,24 +338,34 @@ impl TextSystem {
             ([0.0_f32, 0.0, 0.0, 0.9], [1.0_f32, 1.0, 1.0, 0.8])
         };
 
-        // Spatial grids for O(1) collision detection — separate grids so
-        // streets, POIs, and city/park labels don't compete for placement
-        let grid_cell = 2.0f32 * 2.0f32.powf(-zoom * 0.5);
-        let mut grid_main: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let mut grid_streets: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let mut grid_pois: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        // Real world-space AABB collision. Replaces the old spatial-grid
+        // heuristic — we now measure each label's actual visual extent and
+        // do rectangle-rectangle intersection tests, so labels can't visually
+        // overlap regardless of their size differences.
+        // world_per_px matches the curved-label placement derivation so our
+        // collision bounds correspond to actual rendered pixel extents.
+        let vp_scale = 1000.0 / viewport_min.max(1.0);
+        let world_per_px = 0.1 / 2.0_f32.powf(zoom * 0.5) * vp_scale;
+
+        struct LabelAabb {
+            min_x: f32, max_x: f32, min_y: f32, max_y: f32,
+        }
+        let mut accepted: Vec<LabelAabb> = Vec::with_capacity(512);
         let max_labels = 1500;
         let mut label_count = 0u32;
 
-        // Sort labels by priority: Cities first, then Streets, then Parks, then rest
+        // Priority order (lowest number = highest priority):
+        // State > City > Subdivision > Listing > Park > Street (Road) > Poi (Business) > Building
         let mut sorted_labels: Vec<&Label> = labels.iter().collect();
         sorted_labels.sort_by_key(|l| match l.kind {
-            crate::mapdata::LabelKind::City => 0,
-            crate::mapdata::LabelKind::Listing => 1,
-            crate::mapdata::LabelKind::Street => 2,
-            crate::mapdata::LabelKind::Park => 3,
-            crate::mapdata::LabelKind::Building => 4,
-            crate::mapdata::LabelKind::Poi => 5,
+            crate::mapdata::LabelKind::State => 0,
+            crate::mapdata::LabelKind::City => 1,
+            crate::mapdata::LabelKind::District => 2,
+            crate::mapdata::LabelKind::Marker => 3,
+            crate::mapdata::LabelKind::Park => 4,
+            crate::mapdata::LabelKind::Street => 5,
+            crate::mapdata::LabelKind::Poi => 6,
+            crate::mapdata::LabelKind::Building => 7,
         });
 
         for label in &sorted_labels {
@@ -313,8 +375,10 @@ impl TextSystem {
 
             // Filter labels by zoom level
             let min_zoom = match label.kind {
+                crate::mapdata::LabelKind::State => -10.0,
                 crate::mapdata::LabelKind::City => -10.0,
-                crate::mapdata::LabelKind::Listing => -10.0,
+                crate::mapdata::LabelKind::District => -4.0,
+                crate::mapdata::LabelKind::Marker => -10.0,
                 crate::mapdata::LabelKind::Park => -2.0,
                 crate::mapdata::LabelKind::Street => -10.0,
                 crate::mapdata::LabelKind::Building => 0.5,
@@ -324,44 +388,12 @@ impl TextSystem {
                 continue;
             }
 
-            let is_listing = matches!(label.kind, crate::mapdata::LabelKind::Listing);
-            let is_street = matches!(label.kind, crate::mapdata::LabelKind::Street);
-            let is_poi = matches!(label.kind, crate::mapdata::LabelKind::Poi);
-
-            // Each label type gets its own grid cell size and collision grid
-            let cell = if is_street {
-                grid_cell * 0.3
-            } else if is_poi {
-                grid_cell * 0.25
-            } else {
-                grid_cell
-            };
-            let gx = (label.position[0] / cell).floor() as i32;
-            let gy = (label.position[1] / cell).floor() as i32;
-
-            let grid = if is_street {
-                &mut grid_streets
-            } else if is_poi {
-                &mut grid_pois
-            } else {
-                &mut grid_main
-            };
-
-            if !is_listing {
-                let occupied = (-1..=1).any(|dx| {
-                    (-1..=1).any(|dy| grid.contains(&(gx + dx, gy + dy)))
-                });
-                if occupied {
-                    continue;
-                }
-            }
-            grid.insert((gx, gy));
-            label_count += 1;
-
+            let is_listing = matches!(label.kind, crate::mapdata::LabelKind::Marker);
             let scale = label.font_scale();
+            let spacing = label.letter_spacing();
 
             let (label_text_color, label_halo_color) = match label.kind {
-                crate::mapdata::LabelKind::Listing => {
+                crate::mapdata::LabelKind::Marker => {
                     if land_active && land_lum < 0.3 {
                         ([1.0_f32, 1.0, 1.0, 1.0], [0.0_f32, 0.0, 0.0, 0.9])
                     } else {
@@ -373,12 +405,38 @@ impl TextSystem {
                 }
                 _ => (text_color, halo_color),
             };
-            // Measure total width for centering (with per-label letter spacing)
-            let spacing = label.letter_spacing();
+
+            // Measure total width for centering and collision bounds
             let total_width: f32 = label.text.chars()
                 .filter_map(|c| self.get_glyph(c))
                 .map(|g| g.advance * scale * spacing)
                 .sum();
+
+            // World-space AABB based on actual rendered label extent.
+            // Small inflation hides hairline edge-touching at the pixel level.
+            let half_w_world = total_width * 0.5 * world_per_px * 1.05;
+            let half_h_world = self.font_size * scale * 0.5 * world_per_px * 1.5;
+            let my_aabb = LabelAabb {
+                min_x: label.position[0] - half_w_world,
+                max_x: label.position[0] + half_w_world,
+                min_y: label.position[1] - half_h_world,
+                max_y: label.position[1] + half_h_world,
+            };
+
+            // Listings (user's own homes) always render — they're the primary overlay.
+            if !is_listing {
+                let overlaps = accepted.iter().any(|a| {
+                    !(my_aabb.max_x < a.min_x
+                        || my_aabb.min_x > a.max_x
+                        || my_aabb.max_y < a.min_y
+                        || my_aabb.min_y > a.max_y)
+                });
+                if overlaps {
+                    continue;
+                }
+            }
+            accepted.push(my_aabb);
+            label_count += 1;
 
             // Curved road labels: place each glyph at its own world position along the path
             if let Some(ref path) = label.path {
@@ -386,6 +444,7 @@ impl TextSystem {
                     self.emit_curved_label(
                         path, &label.text, &label.position, scale, spacing, total_width, zoom,
                         label_text_color, label_halo_color,
+                        viewport_min,
                         &mut vertices, &mut indices,
                     );
                     continue;
@@ -564,6 +623,7 @@ impl TextSystem {
         zoom: f32,
         text_color: [f32; 4],
         halo_color: [f32; 4],
+        viewport_min: f32,
         vertices: &mut Vec<TextVertex>,
         indices: &mut Vec<u32>,
     ) {
@@ -603,10 +663,13 @@ impl TextSystem {
         if glyphs.is_empty() { return; }
 
         // Convert pixel advance to world units, matching the text shader's zoom scaling.
-        // Derived from: shader zoom_scale = 2^(z*0.5) * (1000/ref_size),
-        // ortho projection scale = 100 / 2^z, ref_size = 1000.
-        // Result: world_per_pixel = 0.2 / 2^(zoom * 0.5)
-        let world_per_px = 0.05 / 2.0_f32.powf(zoom * 0.5);
+        // Shader zoom_scale = 2^(z*0.5), ortho projection scale = 100 / 2^z.
+        // Derivation: world_per_pixel_screen = 100 / (viewport * pow(2, z*0.5)).
+        // Constant 0.1 comes from 100 / 1000 (the viewport_min normalizer).
+        // Previously 0.05 was tuned for the old shader's extra (1000/ref_size) factor;
+        // with that removed, the correct base is 0.1.
+        let vp_scale = 1000.0 / viewport_min.max(1.0);
+        let world_per_px = 0.1 / 2.0_f32.powf(zoom * 0.5) * vp_scale;
 
         // Starting distance along the path (center the text on the anchor)
         let start_dist = anchor_dist - total_width_px * world_per_px * 0.5;

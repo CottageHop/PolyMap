@@ -50,6 +50,9 @@ class RangeHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
+        # Dev server: never let the browser cache WASM/JS so rebuilds take effect on reload.
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
         super().end_headers()
 
 

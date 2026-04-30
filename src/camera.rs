@@ -44,13 +44,19 @@ pub struct CameraUniform {
     pub cloud_opacity: f32,
     /// Cloud animation speed multiplier (0 = frozen, 1 = default)
     pub cloud_speed: f32,
-    pub _pad2: [f32; 3],
+    /// Label opacity multiplier. Dimmed during camera motion to hide
+    /// the lag between zoom change and label rebuild.
+    pub label_alpha: f32,
+    pub _pad2: [f32; 2],
     /// Color tints — when alpha > 0.5, replaces the base vertex color for that material
     pub water_tint: [f32; 4],
     pub park_tint: [f32; 4],
     pub building_tint: [f32; 4],
     pub road_tint: [f32; 4],
     pub land_tint: [f32; 4],
+    /// Rail tint. Applies to both rail base and crossties (ties auto-darken
+    /// to ~0.7× the picked color to keep the track pattern readable).
+    pub rail_tint: [f32; 4],
 }
 
 impl Default for CameraUniform {
@@ -64,12 +70,14 @@ impl Default for CameraUniform {
             tilt: 1.5,
             cloud_opacity: 1.0,
             cloud_speed: 1.0,
-            _pad2: [0.0; 3],
+            label_alpha: 1.0,
+            _pad2: [0.0; 2],
             water_tint: [0.0; 4],
             park_tint: [0.0; 4],
             building_tint: [0.0; 4],
             road_tint: [0.0; 4],
             land_tint: [0.0; 4],
+            rail_tint: [0.0; 4],
         }
     }
 }
@@ -97,7 +105,7 @@ impl Camera {
     /// The world point under `screen_pos` stays fixed after zooming.
     pub fn zoom_at(&mut self, delta: f32, screen_pos: Vec2) {
         let old_zoom = self.target_zoom;
-        let new_zoom = (old_zoom + delta).clamp(-2.0, 2.5);
+        let new_zoom = (old_zoom + delta).clamp(-3.5, 2.5);
         if (new_zoom - old_zoom).abs() < 1e-6 {
             return;
         }
@@ -218,12 +226,14 @@ impl Camera {
             tilt: self.tilt,
             cloud_opacity: 1.0,
             cloud_speed: 1.0,
-            _pad2: [0.0; 3],
+            label_alpha: 1.0,
+            _pad2: [0.0; 2],
             water_tint: [0.0; 4],
             park_tint: [0.0; 4],
             building_tint: [0.0; 4],
             road_tint: [0.0; 4],
             land_tint: [0.0; 4],
+            rail_tint: [0.0; 4],
         }
     }
 
@@ -245,7 +255,7 @@ impl Camera {
 
     /// Set the target zoom for smooth zooming.
     pub fn set_target_zoom(&mut self, zoom: f32) {
-        self.target_zoom = zoom.clamp(-2.0, 2.5);
+        self.target_zoom = zoom.clamp(-3.5, 2.5);
         self.dirty = true;
     }
 
@@ -253,6 +263,38 @@ impl Camera {
     pub fn set_target_tilt(&mut self, tilt: f32) {
         self.target_tilt = tilt.clamp(0.4, 1.5);
         self.dirty = true;
+    }
+
+    /// Axis-aligned world-space bounds of what the camera can see at z=0.
+    /// Accounts for tilt — a tilted view covers a larger ground area than the
+    /// ortho box would alone. Returns (min_x, min_y, max_x, max_y) in world units.
+    /// Conservative: pads by 30% of the viewport extent so tall buildings
+    /// whose ground bbox is just off-screen but whose tops are still visible
+    /// don't get culled.
+    pub fn world_aabb(&self) -> (f32, f32, f32, f32) {
+        // Unproject the four screen corners to world z=0 and take their AABB.
+        let points = [
+            self.unproject_to_world(0.0, 0.0),
+            self.unproject_to_world(self.viewport.x, 0.0),
+            self.unproject_to_world(0.0, self.viewport.y),
+            self.unproject_to_world(self.viewport.x, self.viewport.y),
+        ];
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for p in &points {
+            if p.x < min_x { min_x = p.x; }
+            if p.y < min_y { min_y = p.y; }
+            if p.x > max_x { max_x = p.x; }
+            if p.y > max_y { max_y = p.y; }
+        }
+        // Pad the AABB so we don't cull tiles whose tall buildings would still
+        // project into the viewport even if their ground bbox is just outside.
+        // Tilt is along Y, so pad Y more aggressively.
+        let pad_x = (max_x - min_x) * 0.25;
+        let pad_y = (max_y - min_y) * 0.50;
+        (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
     }
 
     /// Unproject screen pixel coordinates to world XY (at z=0 plane).

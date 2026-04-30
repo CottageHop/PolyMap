@@ -1,24 +1,62 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::gpu::GpuState;
 use crate::mapdata::{self, MapData, MapVertex, Label};
 use crate::mvt_convert::DetailLevel;
 
+/// LRU-tracked cache. The companion VecDeque stores keys in insertion/access
+/// order so eviction on capacity overflow drops the single oldest entry
+/// instead of wiping the whole map (which caused frame stutter on pan).
+#[cfg(target_arch = "wasm32")]
+struct LruCache<K: Eq + std::hash::Hash + Clone, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+    cap: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    }
+    fn get(&self, key: &K) -> Option<&V> { self.map.get(key) }
+    fn insert(&mut self, key: K, value: V) {
+        if !self.map.contains_key(&key) {
+            if self.map.len() >= self.cap {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.map.insert(key, value);
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static CURRENT_DETAIL: std::cell::Cell<DetailLevel> = std::cell::Cell::new(DetailLevel::High);
     /// Cache of generated MapData by (z14 tile x, y, detail level).
     /// Uses Rc to avoid cloning multi-MB vertex arrays on cache hit.
-    static MAPDATA_CACHE: std::cell::RefCell<HashMap<(u32, u32, u8), Rc<MapData>>> =
-        std::cell::RefCell::new(HashMap::new());
+    /// LRU eviction at cap to avoid the frame-stutter sawtooth a full-clear would cause.
+    static MAPDATA_CACHE: std::cell::RefCell<LruCache<(u32, u32, u8), Rc<MapData>>> =
+        std::cell::RefCell::new(LruCache::new(64));
     /// Tracks which z14 tiles already have geometry rendered.
     static RENDERED_Z14: std::cell::RefCell<std::collections::HashSet<(u32, u32)>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Determine detail level from camera zoom.
-/// Always High — show everything at every zoom level.
+/// Currently always High — the detail-level gating in mvt_convert.rs only
+/// touches POIs and road outlines, so switching tiers triggers a full
+/// MAPDATA_CACHE wipe + tile re-fetch for essentially zero geometry savings.
+/// Re-introduce zoom-based LOD once more mvt_convert paths gate walls,
+/// shadows, and trees by detail level.
 pub fn detail_for_zoom(_zoom: f32) -> DetailLevel {
     DetailLevel::High
 }
@@ -38,11 +76,21 @@ pub fn clear_rendered_z14() {
 /// Tile size in degrees (~1.1km per tile).
 pub const TILE_SIZE: f64 = 0.01;
 
-/// Maximum number of tiles kept in memory.
-const MAX_TILES: usize = 128;
+/// Maximum number of tiles whose GPU buffers (vertex/index/shadow) are
+/// retained simultaneously. Each loaded tile holds several wgpu::Buffer
+/// allocations totaling ~3-5 MB depending on density; 32 tiles ≈ 100-160 MB
+/// of GPU memory at the high end. Beyond that, Safari starts hitting its
+/// per-tab memory ceiling.
+///
+/// Eviction is LRU on `last_visible_frame`. Re-entering a previously-evicted
+/// tile is cheap because the decoded `MapData` is still cached on the CPU
+/// side (`MAPDATA_CACHE`, 64 entries) — we just rebuild the GPU buffers
+/// without re-fetching or re-decoding.
+const MAX_TILES: usize = 32;
 
-/// Maximum concurrent tile fetches.
-const MAX_IN_FLIGHT: usize = 8;
+/// Maximum concurrent tile fetches. Lower = less peak memory during pan
+/// (fewer simultaneous decodes), slightly slower fill-in.
+const MAX_IN_FLIGHT: usize = 6;
 
 /// Minimum seconds between tile fetch requests.
 const FETCH_INTERVAL: f64 = 0.01;
@@ -89,42 +137,64 @@ pub enum TileState {
 
 pub struct LoadedTile {
     pub vertex_buffer: wgpu::Buffer,
+    /// Parallel vertex buffer holding `birth_time: f32` per vertex — the tile's
+    /// upload time (seconds since app start). Shader compares to camera.time
+    /// to fade the tile in smoothly on load. Matches the vertex count of
+    /// `vertex_buffer`.
+    pub birth_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
     pub shadow_vertex_buffer: Option<wgpu::Buffer>,
+    pub shadow_birth_buffer: Option<wgpu::Buffer>,
     pub shadow_index_buffer: Option<wgpu::Buffer>,
     pub num_shadow_indices: u32,
     pub labels: Vec<Label>,
+    pub cars: Vec<crate::mapdata::Car>,
+    pub noise_sources: Vec<crate::mapdata::NoiseSource>,
     pub last_visible_frame: u64,
     /// z14 MVT tile coordinates — used for dedup in rendering
     pub z14_tile: (u32, u32),
 }
 
 impl LoadedTile {
-    pub fn from_map_data(gpu: &GpuState, data: &MapData, z14_tile: (u32, u32)) -> Self {
+    pub fn from_map_data(gpu: &GpuState, data: &MapData, z14_tile: (u32, u32), birth_time: f32) -> Self {
         let vertex_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile VB",
             bytemuck::cast_slice(&data.vertices), wgpu::BufferUsages::VERTEX);
         let index_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile IB",
             bytemuck::cast_slice(&data.indices), wgpu::BufferUsages::INDEX);
 
-        let (shadow_vb, shadow_ib, num_shadow) = if !data.shadow_vertices.is_empty() {
+        // Parallel birth-time buffer: one f32 per vertex, all the same value.
+        // Keeps the main vertex layout binary-compatible with polymap-worker
+        // while letting the shader fade the tile in on load.
+        let birth_data: Vec<f32> = vec![birth_time; data.vertices.len().max(1)];
+        let birth_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile Birth VB",
+            bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX);
+
+        let (shadow_vb, shadow_bb, shadow_ib, num_shadow) = if !data.shadow_vertices.is_empty() {
             let svb = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile SVB",
                 bytemuck::cast_slice(&data.shadow_vertices), wgpu::BufferUsages::VERTEX);
+            let shadow_birth: Vec<f32> = vec![birth_time; data.shadow_vertices.len()];
+            let sbb = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile Shadow Birth VB",
+                bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX);
             let sib = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile SIB",
                 bytemuck::cast_slice(&data.shadow_indices), wgpu::BufferUsages::INDEX);
-            (Some(svb), Some(sib), data.shadow_indices.len() as u32)
+            (Some(svb), Some(sbb), Some(sib), data.shadow_indices.len() as u32)
         } else {
-            (None, None, 0)
+            (None, None, None, 0)
         };
 
         Self {
             vertex_buffer,
+            birth_buffer,
             index_buffer,
             num_indices: data.indices.len() as u32,
             shadow_vertex_buffer: shadow_vb,
+            shadow_birth_buffer: shadow_bb,
             shadow_index_buffer: shadow_ib,
             num_shadow_indices: num_shadow,
             labels: data.labels.clone(),
+            cars: data.cars.clone(),
+            noise_sources: data.noise_sources.clone(),
             last_visible_frame: 0,
             z14_tile,
         }
@@ -333,7 +403,11 @@ impl TileManager {
     fn record_failure(&mut self, coord: TileCoord) {
         let retries = self.fail_counts.entry(coord).or_insert(0);
         *retries += 1;
-        let backoff = FAIL_BACKOFF_BASE_SECS * 2.0_f64.powi((*retries - 1) as i32);
+        // Cap the exponent so repeated failures after eviction-then-revisit
+        // don't produce `inf` and panic `Duration::from_secs_f64`. Capping at
+        // 20 gives a maximum backoff of ~24 days, plenty.
+        let exp = ((*retries as i64 - 1).clamp(0, 20)) as i32;
+        let backoff = FAIL_BACKOFF_BASE_SECS * 2.0_f64.powi(exp);
         self.tiles.insert(coord, TileState::Failed(
             web_time::Instant::now() + std::time::Duration::from_secs_f64(backoff),
         ));
@@ -394,7 +468,9 @@ impl TileManager {
     }
 
     /// Poll for completed tile fetches and upload to GPU.
-    pub fn poll_completed(&mut self, gpu: &GpuState) {
+    /// `now_secs` is seconds since app start; stamped into each tile's
+    /// vertex data so the map shader can fade the tile in on load.
+    pub fn poll_completed(&mut self, gpu: &GpuState, now_secs: f32) {
         self.tiles_changed = false;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -409,7 +485,7 @@ impl TileManager {
                             let mid_lat = (s + n) / 2.0;
                             let mid_lon = (w + e) / 2.0;
                             let (tx, ty) = latlon_to_zxy(mid_lat, mid_lon, 14);
-                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty));
+                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty), now_secs);
                             self.fail_counts.remove(&coord);
                             self.tiles.insert(coord, TileState::Loaded(loaded));
                         } else {
@@ -445,7 +521,7 @@ impl TileManager {
                             let mid_lat = (s + n) / 2.0;
                             let mid_lon = (w + e) / 2.0;
                             let (tx, ty) = latlon_to_zxy(mid_lat, mid_lon, 14);
-                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty));
+                            let loaded = LoadedTile::from_map_data(gpu, &data, (tx, ty), now_secs);
                             self.fail_counts.remove(&coord);
                             self.tiles.insert(coord, TileState::Loaded(loaded));
                         } else {
@@ -503,6 +579,11 @@ impl TileManager {
 
             if let Some((coord, _)) = oldest {
                 self.tiles.remove(&coord);
+                // Don't leak the retry counter — if the tile comes back into
+                // view later we want a fresh budget, not to resume from an old
+                // accumulated count (which could eventually overflow the
+                // backoff exponent).
+                self.fail_counts.remove(&coord);
                 evicted += 1;
             } else {
                 break; // all remaining tiles are currently visible — can't evict
@@ -527,6 +608,36 @@ impl TileManager {
     }
 
     /// Get all loaded tiles for rendering.
+    /// Loaded tiles whose projected world AABB intersects the given camera AABB.
+    /// Culls cache entries that are loaded but off-screen, so the renderer
+    /// never submits geometry for them.
+    pub fn loaded_tiles_in_aabb(
+        &self,
+        cam_aabb: (f32, f32, f32, f32),
+    ) -> impl Iterator<Item = &LoadedTile> {
+        let (cmin_x, cmin_y, cmax_x, cmax_y) = cam_aabb;
+        let center_lat = self.center_lat;
+        let center_lon = self.center_lon;
+        self.tiles.iter().filter_map(move |(coord, state)| {
+            let tile = match state {
+                TileState::Loaded(t) | TileState::Stale(t) => t,
+                _ => return None,
+            };
+            let (s, w, n, e) = coord.bbox();
+            // Project the four corners of the tile's lat/lon bbox to world.
+            let sw = crate::mapdata::project_pub(s, w, center_lat, center_lon);
+            let ne = crate::mapdata::project_pub(n, e, center_lat, center_lon);
+            let tile_min_x = sw[0].min(ne[0]);
+            let tile_max_x = sw[0].max(ne[0]);
+            let tile_min_y = sw[1].min(ne[1]);
+            let tile_max_y = sw[1].max(ne[1]);
+            // AABB intersection test
+            if tile_max_x < cmin_x || tile_min_x > cmax_x { return None; }
+            if tile_max_y < cmin_y || tile_min_y > cmax_y { return None; }
+            Some(tile)
+        })
+    }
+
     pub fn loaded_tiles(&self) -> impl Iterator<Item = &LoadedTile> {
         self.tiles.values().filter_map(|state| {
             match state {
@@ -593,12 +704,14 @@ fn latlon_to_zxy(lat: f64, lon: f64, z: u8) -> (u32, u32) {
 // ── z14 MVT raw bytes cache ──────────────────────────────────────
 // Multiple 0.01° PolyMap tiles map to the same z14 MVT tile (~0.022°).
 // Cache raw decompressed bytes to avoid redundant HTTP fetches.
+// LRU eviction so overflow drops one entry rather than stalling the
+// frame with a catastrophic full-cache deallocation.
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static MVT_BYTES_CACHE: std::cell::RefCell<HashMap<(u32, u32), Rc<Vec<u8>>>> =
-        std::cell::RefCell::new(HashMap::new());
-    static PARCEL_BYTES_CACHE: std::cell::RefCell<HashMap<(u32, u32), Rc<Vec<u8>>>> =
-        std::cell::RefCell::new(HashMap::new());
+    static MVT_BYTES_CACHE: std::cell::RefCell<LruCache<(u32, u32), Rc<Vec<u8>>>> =
+        std::cell::RefCell::new(LruCache::new(32));
+    static PARCEL_BYTES_CACHE: std::cell::RefCell<LruCache<(u32, u32), Rc<Vec<u8>>>> =
+        std::cell::RefCell::new(LruCache::new(64));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -614,9 +727,7 @@ async fn get_or_fetch_mvt_bytes(url: &str, z: u8, tx: u32, ty: u32) -> Result<Rc
 
     let rc_data = Rc::new(tile_data);
     MVT_BYTES_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() > 32 { cache.clear(); }
-        cache.insert((tx, ty), Rc::clone(&rc_data));
+        c.borrow_mut().insert((tx, ty), Rc::clone(&rc_data));
     });
 
     Ok(rc_data)
@@ -636,9 +747,7 @@ async fn get_or_fetch_parcel_bytes(url: &str, z: u8, tx: u32, ty: u32) -> Result
 
     let rc_data = Rc::new(tile_data);
     PARCEL_BYTES_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() > 64 { cache.clear(); }
-        cache.insert((tx, ty), Rc::clone(&rc_data));
+        c.borrow_mut().insert((tx, ty), Rc::clone(&rc_data));
     });
 
     Ok(rc_data)
@@ -683,11 +792,10 @@ async fn fetch_tile_wasm(
             // Parcel overlay disabled
 
             let rc_data = Rc::new(data);
-            // Cache for other PolyMap tiles sharing this z14 tile
+            // Cache for other PolyMap tiles sharing this z14 tile.
+            // LRU eviction in insert() drops only the oldest entry on overflow.
             MAPDATA_CACHE.with(|c| {
-                let mut cache = c.borrow_mut();
-                if cache.len() > 64 { cache.clear(); }
-                cache.insert((tx, ty, detail_key), Rc::clone(&rc_data));
+                c.borrow_mut().insert((tx, ty, detail_key), Rc::clone(&rc_data));
             });
 
             rc_data
@@ -706,7 +814,7 @@ async fn fetch_tile_wasm(
             base, south, west, north, east
         );
 
-        let body = crate::wasm_fetch_text(&api_url, "GET", None, None)
+        let body = crate::app::wasm_fetch_text(&api_url, "GET", None, None)
             .await
             .ok_or("API fetch failed")?;
 

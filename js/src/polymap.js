@@ -5,6 +5,29 @@
 
 let wasmModule = null;
 
+// ── Theme definitions ─────────────────────────────────────────────
+// Shared between the control panel and the public PolyMapInstance.applyTheme()
+// so external callers can set a theme without the control panel being mounted.
+const SRGB_TO_LINEAR = (c) =>
+  c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+const HEX_TO_RGBA = (hex) => {
+  const r = SRGB_TO_LINEAR(parseInt(hex.slice(1, 3), 16) / 255);
+  const g = SRGB_TO_LINEAR(parseInt(hex.slice(3, 5), 16) / 255);
+  const b = SRGB_TO_LINEAR(parseInt(hex.slice(5, 7), 16) / 255);
+  return [r, g, b, 1.0];
+};
+export const THEMES = {
+  cottagecore:     { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
+  cottagecoredark: { water:'#4a7fb0', park:'#3e6b28', building:'#d9b08f', road:'#9a9a9a', land:'#1a2e1a', marker:'#c0392b', cloudOpacity:2,  clouds:true },
+  cyberpunk:       { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0,  clouds:false },
+  modern:          { water:'#42a5f5', park:'#8bc34a', building:'#e0e0e0', road:'#bdbdbd', land:'#f5f5f5', marker:'#1976d2', cloudOpacity:30, clouds:true },
+  greyscale:       { water:'#888888', park:'#aaaaaa', building:'#666666', road:'#777777', land:'#f0f0f0', marker:'#444444', cloudOpacity:20, clouds:true },
+  dark:            { water:'#1a3a4a', park:'#1e3a1e', building:'#2a2a2a', road:'#5a5a5a', land:'#1a1a1a', marker:'#e0e0e0', cloudOpacity:15, clouds:true },
+  eighties:        { water:'#0099dd', park:'#7bef2a', building:'#e5573e', road:'#ff1493', land:'#ffd732', marker:'#0099dd', cloudOpacity:0,  clouds:false },
+  seventies:       { water:'#4ca8a8', park:'#f7c868', building:'#e87848', road:'#e03030', land:'#fdd998', marker:'#e03030', cloudOpacity:0,  clouds:false },
+  oldworld:        { water:'#5b7e8a', park:'#6b7c47', building:'#c4a265', road:'#8b4513', land:'#e8d5a3', marker:'#8b0000', cloudOpacity:0,  clouds:false },
+};
+
 /** Create a canvas for pixel manipulation (Safari fallback for OffscreenCanvas). */
 function createPixelCanvas(w, h) {
   if (typeof OffscreenCanvas !== 'undefined') {
@@ -102,7 +125,7 @@ export async function createPolyMap(container, options = {}) {
     const w = new Worker('/polymap/tile-worker.js', { type: 'module' });
     w.busy = false;
     w.onmessage = (e) => {
-      const { type, id, error, empty, vertices, indices, shadowVertices, shadowIndices, labels, z14Tile } = e.data;
+      const { type, id, error, empty, vertices, indices, shadowVertices, shadowIndices, noiseSources, labels, z14Tile } = e.data;
       if (type === 'ready') return;
       if (type === 'error') {
         console.warn('[PolyMap Worker] Error:', error);
@@ -121,6 +144,7 @@ export async function createPolyMap(container, options = {}) {
           new Uint32Array(shadowIndices?.buffer || shadowIndices || []),
           labels || '[]',
           z14Tile || '0,0',
+          noiseSources ? new Float32Array(noiseSources.buffer || noiseSources) : undefined,
         );
       } else if (tile) {
         // Empty or failed — release the in-flight slot
@@ -476,6 +500,37 @@ class PolyMapInstance {
     if (this._controls) this._controls.style.display = 'none';
   }
 
+  /**
+   * Apply one of the built-in theme presets by name. Drives colors, cloud
+   * opacity/visibility, and the marker accent CSS variable — same effect as
+   * clicking the theme button in the control panel.
+   * @param {keyof typeof THEMES | string} name
+   */
+  applyTheme(name) {
+    const t = THEMES[name];
+    if (!t) return this;
+    if (t.useDefaults) {
+      this.setColors({ water: [0,0,0,0], park: [0,0,0,0], building: [0,0,0,0], road: [0,0,0,0], land: [0,0,0,0], rail: [0,0,0,0] });
+    } else {
+      this.setColors({
+        water: HEX_TO_RGBA(t.water),
+        park: HEX_TO_RGBA(t.park),
+        building: HEX_TO_RGBA(t.building),
+        road: HEX_TO_RGBA(t.road),
+        land: HEX_TO_RGBA(t.land),
+        // Themes can optionally define t.rail; fall back to clearing the
+        // rail tint so the vertex default (COLOR_RAIL) shows through.
+        rail: t.rail ? HEX_TO_RGBA(t.rail) : [0,0,0,0],
+      });
+    }
+    this.setCloudOpacity(t.cloudOpacity / 100);
+    this.setLayerVisible('clouds', t.clouds);
+    if (t.marker && typeof document !== 'undefined') {
+      document.documentElement.style.setProperty('--marker-color', t.marker);
+    }
+    return this;
+  }
+
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
@@ -519,41 +574,16 @@ class PolyMapInstance {
  * @returns {HTMLElement}
  */
 function createControlsPanel(container, map) {
-  const srgbToLinear = (c) =>
-    c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  const hexToRgba = (hex) => {
-    const r = srgbToLinear(parseInt(hex.slice(1, 3), 16) / 255);
-    const g = srgbToLinear(parseInt(hex.slice(3, 5), 16) / 255);
-    const b = srgbToLinear(parseInt(hex.slice(5, 7), 16) / 255);
-    return [r, g, b, 1.0];
-  };
-
-  const THEMES = {
-    cottagecore: { water:'#99b3a6', park:'#8c9959', building:'#d9b08f', road:'#8c7061', land:'#f2e6d9', marker:'#c0392b', cloudOpacity:50, clouds:true, useDefaults:true },
-    cyberpunk:   { water:'#0a1628', park:'#1a0a12', building:'#a82929', road:'#00d4e8', land:'#0c1020', marker:'#f0c800', cloudOpacity:0, clouds:false },
-    modern:      { water:'#42a5f5', park:'#8bc34a', building:'#e0e0e0', road:'#bdbdbd', land:'#f5f5f5', marker:'#1976d2', cloudOpacity:30, clouds:true },
-    greyscale:   { water:'#888888', park:'#aaaaaa', building:'#666666', road:'#777777', land:'#f0f0f0', marker:'#444444', cloudOpacity:20, clouds:true },
-    dark:        { water:'#1a3a4a', park:'#1e3a1e', building:'#2a2a2a', road:'#5a5a5a', land:'#1a1a1a', marker:'#e0e0e0', cloudOpacity:15, clouds:true },
-    eighties:    { water:'#0099dd', park:'#7bef2a', building:'#e5573e', road:'#ff1493', land:'#ffd732', marker:'#0099dd', cloudOpacity:0, clouds:false },
-    seventies:   { water:'#4ca8a8', park:'#f7c868', building:'#e87848', road:'#e03030', land:'#fdd998', marker:'#e03030', cloudOpacity:0, clouds:false },
-    oldworld:    { water:'#5b7e8a', park:'#6b7c47', building:'#c4a265', road:'#8b4513', land:'#e8d5a3', marker:'#8b0000', cloudOpacity:0, clouds:false },
-  };
-
   function applyTheme(name) {
     const t = THEMES[name];
     if (!t) return;
-    for (const [key, id] of [['water','ctrl-water'],['park','ctrl-park'],['building','ctrl-building'],['road','ctrl-road'],['land','ctrl-land'],['marker','ctrl-marker']]) {
+    // Apply colors + clouds via the shared instance method.
+    map.applyTheme(name);
+    // Sync panel UI to reflect the new theme.
+    for (const [key, id] of [['water','ctrl-water'],['park','ctrl-park'],['building','ctrl-building'],['road','ctrl-road'],['land','ctrl-land'],['rail','ctrl-rail'],['marker','ctrl-marker']]) {
       const el = panel.querySelector('#' + id);
       if (el) el.value = t[key];
     }
-    panel.querySelector('#ctrl-marker')?.dispatchEvent(new Event('input'));
-    if (t.useDefaults) {
-      map.setColors({ water:[0,0,0,0], park:[0,0,0,0], building:[0,0,0,0], road:[0,0,0,0], land:[0,0,0,0] });
-    } else {
-      map.setColors({ water:hexToRgba(t.water), park:hexToRgba(t.park), building:hexToRgba(t.building), road:hexToRgba(t.road), land:hexToRgba(t.land) });
-    }
-    map.setCloudOpacity(t.cloudOpacity / 100);
-    map.setLayerVisible('clouds', t.clouds);
     const opSlider = panel.querySelector('#ctrl-opacity');
     const opVal = panel.querySelector('#ctrl-opacity-val');
     if (opSlider) opSlider.value = t.cloudOpacity;
@@ -569,6 +599,8 @@ function createControlsPanel(container, map) {
   const style = document.createElement('style');
   style.textContent = `
     .polymap-controls.collapsed .pm-body,.polymap-controls.collapsed .pm-title{display:none}
+    .polymap-controls.collapsed{width:auto !important}
+    .polymap-controls.collapsed .pm-header{border-bottom:none;padding:8px 10px}
     .pm-header{display:flex;align-items:center;padding:10px 12px;gap:8px;border-bottom:1px solid rgba(0,0,0,0.06);cursor:pointer;user-select:none}
     .pm-header:hover{background:rgba(0,0,0,0.03)}
     .pm-section{padding:6px 14px 10px}
@@ -595,7 +627,7 @@ function createControlsPanel(container, map) {
   panel.appendChild(style);
 
   const themeButtons = Object.entries(THEMES).map(([name, t]) => {
-    const label = { cottagecore:'Cottage Core', cyberpunk:'Cyberpunk', modern:'Modern', greyscale:'Greyscale', dark:'Dark', eighties:"80's", seventies:"70's", oldworld:'Old World' }[name] || name;
+    const label = { cottagecore:'Cottage Core', cottagecoredark:'Cottage Core Dark', cyberpunk:'Cyberpunk', modern:'Modern', greyscale:'Greyscale', dark:'Dark', eighties:"80's", seventies:"70's", oldworld:'Old World' }[name] || name;
     const colors = [t.land, t.building, t.park, t.water, t.road];
     return `<button class="pm-theme-btn${name==='cottagecore'?' active':''}" data-theme="${name}"><div class="pm-swatches">${colors.map(c=>`<span style="background:${c}"></span>`).join('')}</div><div class="pm-theme-lbl">${label}</div></button>`;
   }).join('');
@@ -613,6 +645,7 @@ function createControlsPanel(container, map) {
         <div class="pm-row"><label>Green Space</label><input type="color" id="ctrl-park" value="#8c9959"></div>
         <div class="pm-row"><label>Buildings</label><input type="color" id="ctrl-building" value="#d9b08f"></div>
         <div class="pm-row"><label>Roads</label><input type="color" id="ctrl-road" value="#8c7061"></div>
+        <div class="pm-row"><label>Rails</label><input type="color" id="ctrl-rail" value="#7b5a47"></div>
         <div class="pm-row"><label>Background</label><input type="color" id="ctrl-land" value="#f2e6d9"></div>
         <div class="pm-row"><label>Markers</label><input type="color" id="ctrl-marker" value="#c0392b"></div>
         <button class="pm-reset">Reset Colors</button>
@@ -639,9 +672,9 @@ function createControlsPanel(container, map) {
   });
 
   // Color pickers
-  for (const [id, key] of [['ctrl-water','water'],['ctrl-park','park'],['ctrl-building','building'],['ctrl-road','road'],['ctrl-land','land']]) {
+  for (const [id, key] of [['ctrl-water','water'],['ctrl-park','park'],['ctrl-building','building'],['ctrl-road','road'],['ctrl-rail','rail'],['ctrl-land','land']]) {
     panel.querySelector('#' + id)?.addEventListener('input', (e) => {
-      map.setColors({ [key]: hexToRgba(e.target.value) });
+      map.setColors({ [key]: HEX_TO_RGBA(e.target.value) });
     });
   }
   panel.querySelector('#ctrl-marker')?.addEventListener('input', (e) => {

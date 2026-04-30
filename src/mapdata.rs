@@ -25,24 +25,37 @@ pub const MAT_GLASS_WALL: f32 = 10.0;
 pub const MAT_FOUNTAIN: f32 = 11.0;
 /// Material for volumetric clouds.
 pub const MAT_CLOUD: f32 = 12.0;
-/// Material for home listing pin.
-pub const MAT_PIN: f32 = 13.0;
 /// Material for commercial zones.
+pub const MAT_RAIL: f32 = 17.0;
+pub const MAT_RAIL_TIE: f32 = 18.0;
 pub const MAT_COMMERCIAL: f32 = 14.0;
 /// Material for residential zones.
 pub const MAT_RESIDENTIAL: f32 = 15.0;
 /// Material for industrial zones.
 pub const MAT_INDUSTRIAL: f32 = 16.0;
 
+/// Material for pitched (gable/hip) building roofs. Spike addition for generative-buildings discovery.
+pub const MAT_BUILDING_ROOF_PITCHED: f32 = 19.0;
+
+/// Roof shape style for a building. Spike scope: Gable only is wired into render path.
+#[derive(Copy, Clone, Debug)]
+pub enum BuildingStyle {
+    Flat,
+    Gable,
+}
+
 /// Height threshold (meters) above which a building is considered a skyscraper.
 const SKYSCRAPER_HEIGHT: f32 = 50.0;
 
 /// Max area (world units²) for a water body to be considered a fountain candidate.
-const FOUNTAIN_MAX_AREA: f32 = 0.15;
+pub(crate) const FOUNTAIN_MAX_AREA: f32 = 0.15;
 /// Minimum circularity (0..1, 1=perfect circle) for fountain detection.
-const FOUNTAIN_MIN_CIRCULARITY: f32 = 0.65;
+pub(crate) const FOUNTAIN_MIN_CIRCULARITY: f32 = 0.65;
 
 /// A single vertex for the map geometry, sent directly to the GPU.
+/// IMPORTANT: this layout must match `polymap-worker`'s MapVertex exactly.
+/// Per-tile data that varies per-frame (fade-in birth time, etc.) lives in
+/// a parallel vertex buffer owned by the main thread, not here.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MapVertex {
@@ -83,11 +96,17 @@ pub struct Label {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum LabelKind {
+    State,
     City,
+    /// District / neighbourhood / suburb. Was named `Subdivision` in earlier
+    /// versions; renamed for general-purpose use.
+    District,
     Street,
     Park,
     Building,
-    Listing,
+    /// User-placed pin / point-of-interest marker. Was named `Listing` in
+    /// earlier versions when the renderer was tuned for a real-estate app.
+    Marker,
     Poi,
 }
 
@@ -95,11 +114,15 @@ impl Label {
     /// Font scale factor based on label type.
     pub fn font_scale(&self) -> f32 {
         match self.kind {
+            LabelKind::State => 2.0,
             LabelKind::City => 1.5,
-            LabelKind::Street => 0.38,
+            LabelKind::District => 0.9,
+            // Street labels match POI (business) labels in both size and
+            // spacing so the text reads as the same weight class.
+            LabelKind::Street => 0.18,
             LabelKind::Park => 0.6,
             LabelKind::Building => 0.4,
-            LabelKind::Listing => 0.65,
+            LabelKind::Marker => 0.65,
             LabelKind::Poi => 0.18,
         }
     }
@@ -107,35 +130,38 @@ impl Label {
     /// Extra letter spacing multiplier (1.0 = normal, >1 = wider)
     pub fn letter_spacing(&self) -> f32 {
         match self.kind {
+            LabelKind::State => 1.5,
             LabelKind::City => 1.35,
-            LabelKind::Street => 1.35,
+            LabelKind::District => 1.25,
+            LabelKind::Street => 1.5,
             LabelKind::Park => 1.1,
-            LabelKind::Building => 1.0,
-            LabelKind::Listing => 1.0,
+            LabelKind::Building => 1.2,
+            LabelKind::Marker => 1.0,
             LabelKind::Poi => 1.0,
         }
     }
 }
 
-/// A home listing to display on the map.
-#[derive(Clone, Debug)]
-pub struct HomeListing {
-    pub lat: f64,
-    pub lon: f64,
-    pub price: String,
-    pub label: String,
-    pub color: [f32; 4],
-    pub sqft: u32,
-    pub beds: u32,
-    pub baths: f32,
-    pub image_url: String,
+/// A single noise-heat-map source. World-space position + dB at 1 world-unit.
+/// The GPU fragment shader applies inverse-square attenuation from there.
+/// Layout matches `NoiseUniform::sources` in noise.wgsl (16-byte aligned).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct NoiseSource {
+    pub pos: [f32; 2],
+    pub db: f32,
+    pub _pad: f32,
 }
 
-/// A placed listing with its world-space position for picking.
+/// One car travelling along a road polyline.
+/// `offset` and `speed` are measured in world units.
 #[derive(Clone, Debug)]
-pub struct PlacedListing {
-    pub listing: HomeListing,
-    pub world_pos: [f32; 2],
+pub struct Car {
+    pub path: Vec<[f32; 2]>,
+    pub path_length: f32,
+    pub offset: f32,
+    pub speed: f32,
+    pub color: [f32; 3],
 }
 
 /// All GPU-ready map geometry.
@@ -146,63 +172,10 @@ pub struct MapData {
     pub shadow_vertices: Vec<MapVertex>,
     pub shadow_indices: Vec<u32>,
     pub labels: Vec<Label>,
-    pub listings: Vec<PlacedListing>,
+    pub cars: Vec<Car>,
+    pub noise_sources: Vec<NoiseSource>,
     pub center_lat: f64,
     pub center_lon: f64,
-}
-
-pub(crate) const COLOR_PIN_DEFAULT: [f32; 4] = [0.65, 0.08, 0.08, 1.0]; // dark red
-pub(crate) const COLOR_PIN_NEEDLE: [f32; 4] = [0.15, 0.15, 0.15, 1.0]; // near black
-const PIN_HEAD_RADIUS: f32 = 0.5;
-const PIN_NEEDLE_RADIUS: f32 = 0.06;
-pub const PIN_HEIGHT: f32 = 20.0;
-
-impl MapData {
-    /// Add home listings to the map. Call this after `fetch_osm_data` / `parse_osm_json`.
-    pub fn add_listings(&mut self, listings: &[HomeListing]) {
-        for listing in listings {
-            let pos = project(listing.lat, listing.lon, self.center_lat, self.center_lon);
-            let pin_color = if listing.color[3] > 0.0 { listing.color } else { COLOR_PIN_DEFAULT };
-
-            // Pin needle (thin cylinder from ground to head)
-            generate_cylinder(
-                pos, PIN_NEEDLE_RADIUS, 0.0, PIN_HEIGHT,
-                COLOR_PIN_NEEDLE, MAT_PIN,
-                6, &mut self.vertices, &mut self.indices,
-            );
-
-            // Pin head (sphere at top)
-            generate_sphere(
-                pos, PIN_HEIGHT, PIN_HEAD_RADIUS,
-                pin_color, MAT_PIN,
-                8, 6, &mut self.vertices, &mut self.indices,
-            );
-
-            // Price label above pin
-            let label_text = if listing.price.is_empty() {
-                listing.label.clone()
-            } else {
-                listing.price.clone()
-            };
-
-            if !label_text.is_empty() {
-                self.labels.push(Label {
-                    text: label_text,
-                    position: pos,
-                    angle: 0.0,
-                    kind: LabelKind::Listing,
-                    path: None,
-                });
-            }
-
-            // Store for picking
-            self.listings.push(PlacedListing {
-                listing: listing.clone(),
-                world_pos: pos,
-            });
-        }
-
-    }
 }
 
 // --- Cottagecore color palette ---
@@ -214,9 +187,9 @@ pub(crate) const COLOR_SIDEWALK_OUTLINE: [f32; 4] = [0.78, 0.70, 0.62, 1.0]; // 
 pub(crate) const COLOR_PARK: [f32; 4] = [0.55, 0.60, 0.35, 1.0];        // olive green (row 2 mid)
 pub(crate) const COLOR_BUILDING: [f32; 4] = [0.85, 0.69, 0.56, 1.0];    // warm peach (row 1 col 4)
 pub(crate) const COLOR_SKYSCRAPER: [f32; 4] = [0.67, 0.72, 0.65, 1.0];  // muted sage (row 2 right)
-pub(crate) const COLOR_ROAD_MAJOR: [f32; 4] = [0.55, 0.44, 0.38, 1.0];  // warm brown (row 3 mid)
-pub(crate) const COLOR_ROAD_MINOR: [f32; 4] = [0.62, 0.52, 0.45, 1.0];  // lighter warm brown
-pub(crate) const COLOR_ROAD_OUTLINE: [f32; 4] = [0.42, 0.30, 0.22, 1.0]; // dark brown (row 3 left)
+pub(crate) const COLOR_ROAD_MAJOR: [f32; 4] = [0.16, 0.14, 0.13, 1.0];  // near-black asphalt (darker than sidewalks)
+pub(crate) const COLOR_ROAD_MINOR: [f32; 4] = [0.22, 0.19, 0.17, 1.0];  // slightly lighter dark asphalt
+pub(crate) const COLOR_ROAD_OUTLINE: [f32; 4] = [0.78, 0.70, 0.62, 1.0]; // warm beige curb/sidewalk strip flanking roads
 pub(crate) const COLOR_RAIL: [f32; 4] = [0.48, 0.35, 0.28, 1.0];        // deep brown (row 3)
 pub(crate) const COLOR_RAIL_TIE: [f32; 4] = [0.38, 0.28, 0.20, 1.0];    // darker brown
 pub(crate) const COLOR_RESIDENTIAL: [f32; 4] = [0.94, 0.88, 0.82, 1.0]; // pale peach (row 1 right)
@@ -833,6 +806,8 @@ pub fn parse_osm_json_centered(
     }
 
     // Layer 4: Buildings — 3D extruded with walls, roof, and outline
+    // SPIKE: render small (likely house-sized) buildings with a gable roof to
+    // validate pitched-roof geometry against the existing pipeline. See discovery plan.
     for (coords, _name, height) in &building_ways {
         // Convert real-world height (meters) to world units
         // PROJ_SCALE maps 1 degree ≈ 10000 units ≈ 111km, so 1 unit ≈ 11.1m
@@ -850,8 +825,17 @@ pub fn parse_osm_json_centered(
         // Walls
         extrude_walls_with_material(coords, z, color, wall_mat, &mut vertices, &mut indices);
 
-        // Roof
-        triangulate_polygon_at_height(coords, z, color, roof_mat, &mut vertices, &mut indices);
+        // Gable for buildings ≤ 15m tall (houses, low-rise). Ridge height scales
+        // with footprint width so the pitch reads at any zoom.
+        let is_house_sized = *height <= 15.0 && coords.len() >= 4;
+        if is_house_sized {
+            let (_, _, _, half_short) = oriented_bbox(coords);
+            let ridge_rise = (half_short * 0.55).max(0.18); // ~28° pitch, min ~2m
+            let ridge_z = z + ridge_rise;
+            triangulate_gable_roof(coords, z, ridge_z, color, MAT_BUILDING_ROOF_PITCHED, &mut vertices, &mut indices);
+        } else {
+            triangulate_polygon_at_height(coords, z, color, roof_mat, &mut vertices, &mut indices);
+        }
 
         // Roof edge outline (tiny z offset to avoid z-fighting with roof surface)
         generate_line_geometry_at_height(coords, 0.03, z + 0.005, COLOR_BUILDING_OUTLINE, MAT_DEFAULT, &mut vertices, &mut indices);
@@ -997,7 +981,8 @@ pub fn parse_osm_json_centered(
         shadow_vertices,
         shadow_indices,
         labels,
-        listings: Vec::new(),
+        cars: Vec::new(),
+        noise_sources: Vec::new(),
         center_lat,
         center_lon,
     })
@@ -1104,7 +1089,7 @@ pub(crate) fn polygon_area(coords: &[[f32; 2]]) -> f32 {
 }
 
 /// Perimeter of a polygon.
-fn polygon_perimeter(coords: &[[f32; 2]]) -> f32 {
+pub(crate) fn polygon_perimeter(coords: &[[f32; 2]]) -> f32 {
     let n = coords.len();
     if n < 2 { return 0.0; }
     let mut perimeter = 0.0f32;
@@ -1174,7 +1159,7 @@ fn polyline_midpoint_and_angle(coords: &[[f32; 2]]) -> ([f32; 2], f32) {
 }
 
 /// Ray-casting point-in-polygon test.
-fn point_in_polygon(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
+pub(crate) fn point_in_polygon(point: [f32; 2], polygon: &[[f32; 2]]) -> bool {
     let (px, py) = (point[0], point[1]);
     let mut inside = false;
     let n = polygon.len();
@@ -1226,7 +1211,7 @@ pub(crate) fn road_width(road_type: &RoadType) -> f32 {
         RoadType::Minor => 0.45,
         RoadType::Residential => 0.30,
         RoadType::Path => 0.16,
-        RoadType::Rail => 0.20,
+        RoadType::Rail => 0.10,
     }
 }
 
@@ -1412,6 +1397,761 @@ pub(crate) fn triangulate_polygon_at_height(
     for idx in tri_indices {
         indices.push(base + idx as u32);
     }
+}
+
+/// Build a hip-style pitched roof by raising the polygon centroid to ridge_z.
+/// Every polygon edge becomes an eave at eave_z; each edge fans up to the
+/// single apex point. Always matches the wall footprint exactly. Each face
+/// gets its own shaded color computed from the 3D face normal so adjacent
+/// slopes read distinctly under directional lighting.
+pub(crate) fn triangulate_hip_roof(
+    coords: &[[f32; 2]],
+    eave_z: f32,
+    ridge_z: f32,
+    color: [f32; 4],
+    material: f32,
+    vertices: &mut Vec<MapVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let pts = if coords.len() > 1 && coords[0] == coords[coords.len() - 1] {
+        &coords[..coords.len() - 1]
+    } else {
+        coords
+    };
+    if pts.len() < 3 {
+        return;
+    }
+
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for p in pts {
+        cx += p[0];
+        cy += p[1];
+    }
+    cx /= pts.len() as f32;
+    cy /= pts.len() as f32;
+
+    // Sun direction matching the existing 2D wall shader, with a +z component
+    // so upward-facing roof slopes read brighter than vertical walls.
+    let sun = [0.5f32, -0.5, 0.7];
+
+    for i in 0..pts.len() {
+        let j = (i + 1) % pts.len();
+        let p0 = pts[i];
+        let p1 = pts[j];
+
+        // Edge vector (in 3D, eaves are coplanar at z=eave_z)
+        let e = [p1[0] - p0[0], p1[1] - p0[1], 0.0];
+        // Apex offset from p0
+        let a = [cx - p0[0], cy - p0[1], ridge_z - eave_z];
+        // Face normal = e × a
+        let nx = e[1] * a[2] - e[2] * a[1];
+        let ny = e[2] * a[0] - e[0] * a[2];
+        let nz = e[0] * a[1] - e[1] * a[0];
+        let nlen = (nx * nx + ny * ny + nz * nz).sqrt();
+        if nlen < 1e-8 {
+            continue;
+        }
+        let (mut nx, mut ny, mut nz) = (nx / nlen, ny / nlen, nz / nlen);
+        // Cross product sign depends on polygon winding; flip to ensure +z up.
+        if nz < 0.0 {
+            nx = -nx; ny = -ny; nz = -nz;
+        }
+        let sun_dot = (nx * sun[0] + ny * sun[1] + nz * sun[2]).max(0.0);
+        let s = 0.55 + sun_dot * 0.5;
+        let c = [color[0] * s, color[1] * s, color[2] * s, 1.0];
+
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p0[0], p0[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(p1[0], p1[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(cx, cy, ridge_z, c, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+}
+
+/// Compute oriented bounding box (OBB) for a polygon, using the longest edge
+/// as the orientation hint. Returns (center, long_axis_unit, half_long, half_short).
+/// Long axis is guaranteed to be the longer of the two.
+pub(crate) fn oriented_bbox(coords: &[[f32; 2]]) -> ([f32; 2], [f32; 2], f32, f32) {
+    let pts = if coords.len() > 1 && coords[0] == coords[coords.len() - 1] {
+        &coords[..coords.len() - 1]
+    } else {
+        coords
+    };
+
+    let mut best_len = 0.0f32;
+    let mut axis = [1.0f32, 0.0];
+    for i in 0..pts.len() {
+        let j = (i + 1) % pts.len();
+        let dx = pts[j][0] - pts[i][0];
+        let dy = pts[j][1] - pts[i][1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > best_len {
+            best_len = len;
+            axis = [dx / len, dy / len];
+        }
+    }
+
+    let perp = [-axis[1], axis[0]];
+    let mut min_u = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for p in pts {
+        let u = p[0] * axis[0] + p[1] * axis[1];
+        let v = p[0] * perp[0] + p[1] * perp[1];
+        min_u = min_u.min(u);
+        max_u = max_u.max(u);
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    let cu = (min_u + max_u) * 0.5;
+    let cv = (min_v + max_v) * 0.5;
+    let center = [cu * axis[0] + cv * perp[0], cu * axis[1] + cv * perp[1]];
+    let mut half_u = (max_u - min_u) * 0.5;
+    let mut half_v = (max_v - min_v) * 0.5;
+    let mut out_axis = axis;
+    if half_v > half_u {
+        out_axis = perp;
+        std::mem::swap(&mut half_u, &mut half_v);
+    }
+    (center, out_axis, half_u, half_v)
+}
+
+/// Scatter tree positions inside a polygon using deterministic random sampling.
+/// Seed comes from the polygon's first vertex so positions are stable across
+/// reloads. Caller appends to `tree_positions`.
+pub(crate) fn scatter_trees_in_polygon(
+    polygon: &[[f32; 2]],
+    target_count: usize,
+    tree_positions: &mut Vec<[f32; 2]>,
+) {
+    if polygon.len() < 3 || target_count == 0 {
+        return;
+    }
+    let mut x_min = f32::INFINITY;
+    let mut x_max = f32::NEG_INFINITY;
+    let mut y_min = f32::INFINITY;
+    let mut y_max = f32::NEG_INFINITY;
+    for p in polygon {
+        if p[0] < x_min { x_min = p[0]; }
+        if p[0] > x_max { x_max = p[0]; }
+        if p[1] < y_min { y_min = p[1]; }
+        if p[1] > y_max { y_max = p[1]; }
+    }
+    let w = x_max - x_min;
+    let h = y_max - y_min;
+    if w < 1e-6 || h < 1e-6 {
+        return;
+    }
+
+    // Deterministic LCG seeded from the polygon's first vertex.
+    let p0 = polygon[0];
+    let seed_a = (p0[0] * 73856093.0_f32).to_bits();
+    let seed_b = (p0[1] * 19349663.0_f32).to_bits();
+    let mut state: u32 = seed_a ^ seed_b ^ 0x9E3779B9;
+    let mut next_rand = || -> f32 {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((state >> 8) & 0x00FFFFFF) as f32 / 16_777_216.0
+    };
+
+    let max_tries = target_count.saturating_mul(8).max(16);
+    let mut accepted = 0;
+    let mut tries = 0;
+    while accepted < target_count && tries < max_tries {
+        tries += 1;
+        let cx = x_min + next_rand() * w;
+        let cy = y_min + next_rand() * h;
+        if point_in_polygon([cx, cy], polygon) {
+            tree_positions.push([cx, cy]);
+            accepted += 1;
+        }
+    }
+}
+
+/// Signed area of a closed polygon (shoelace formula). Positive for CCW windings.
+pub(crate) fn polygon_signed_area(coords: &[[f32; 2]]) -> f32 {
+    let pts = if coords.len() > 1 && coords[0] == coords[coords.len() - 1] {
+        &coords[..coords.len() - 1]
+    } else {
+        coords
+    };
+    if pts.len() < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    for i in 0..pts.len() {
+        let j = (i + 1) % pts.len();
+        sum += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
+    }
+    sum * 0.5
+}
+
+/// Detect whether a polygon is approximately rectangular by comparing its area
+/// to the area of its oriented bounding box. Used to gate the proper-gable
+/// roof: only buildings whose footprint fills ≥ `threshold` of their OBB get a
+/// gable; irregular shapes (L, T, multipolygon parts) fall back to flat.
+pub(crate) fn is_approximately_rectangular(coords: &[[f32; 2]], threshold: f32) -> bool {
+    let polygon_area = polygon_signed_area(coords).abs();
+    if polygon_area < 1e-8 {
+        return false;
+    }
+    let (_, _, half_long, half_short) = oriented_bbox(coords);
+    let obb_area = 4.0 * half_long * half_short;
+    if obb_area < 1e-8 {
+        return false;
+    }
+    polygon_area / obb_area >= threshold
+}
+
+/// Build a proper gable roof on a (mostly) rectangular polygon. Uses the OBB
+/// as the rectangle proxy: two sloped roof faces along the long edges, two
+/// vertical gable-end triangles on the short edges. Each face is shaded from
+/// its 3D normal so adjacent faces read distinctly.
+///
+/// For non-rectangular footprints the OBB extends beyond the polygon — gate
+/// callers on `is_approximately_rectangular` first.
+pub(crate) fn triangulate_gable_roof(
+    coords: &[[f32; 2]],
+    eave_z: f32,
+    ridge_z: f32,
+    color: [f32; 4],
+    material: f32,
+    vertices: &mut Vec<MapVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let (center, axis, half_long, half_short) = oriented_bbox(coords);
+    if half_long < 1e-6 || half_short < 1e-6 {
+        return;
+    }
+    let perp = [-axis[1], axis[0]];
+
+    let p_a = [
+        center[0] - axis[0] * half_long - perp[0] * half_short,
+        center[1] - axis[1] * half_long - perp[1] * half_short,
+    ];
+    let p_b = [
+        center[0] + axis[0] * half_long - perp[0] * half_short,
+        center[1] + axis[1] * half_long - perp[1] * half_short,
+    ];
+    let p_c = [
+        center[0] - axis[0] * half_long + perp[0] * half_short,
+        center[1] - axis[1] * half_long + perp[1] * half_short,
+    ];
+    let p_d = [
+        center[0] + axis[0] * half_long + perp[0] * half_short,
+        center[1] + axis[1] * half_long + perp[1] * half_short,
+    ];
+    let r0 = [center[0] - axis[0] * half_long, center[1] - axis[1] * half_long];
+    let r1 = [center[0] + axis[0] * half_long, center[1] + axis[1] * half_long];
+
+    // Sun direction matching triangulate_hip_roof — vertical component so
+    // upward-facing slopes read brighter than vertical walls.
+    let sun = [0.5f32, -0.5, 0.7];
+    let shade_face = |n: [f32; 3]| -> [f32; 4] {
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-8);
+        let nx = n[0] / len;
+        let ny = n[1] / len;
+        let nz = n[2] / len;
+        let sun_dot = (nx * sun[0] + ny * sun[1] + nz * sun[2]).max(0.0);
+        let s = 0.55 + sun_dot * 0.5;
+        [color[0] * s, color[1] * s, color[2] * s, 1.0]
+    };
+
+    let rise = ridge_z - eave_z;
+
+    // Outward face normal of a slope: XY component scaled by `rise`, Z by run
+    // (run = half_short for gable slopes). This makes shallow slopes more
+    // upward-facing and steep slopes more horizontal — opposite of the
+    // earlier formulation which had X/Z swapped.
+    {
+        let n = [-perp[0] * rise, -perp[1] * rise, half_short];
+        let c = shade_face(n);
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p_a[0], p_a[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(p_b[0], p_b[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(r0[0], r0[1], ridge_z, c, material));
+        vertices.push(MapVertex::at_height(r1[0], r1[1], ridge_z, c, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+    // Slope face on +perp side.
+    {
+        let n = [perp[0] * rise, perp[1] * rise, half_short];
+        let c = shade_face(n);
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p_c[0], p_c[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(p_d[0], p_d[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(r0[0], r0[1], ridge_z, c, material));
+        vertices.push(MapVertex::at_height(r1[0], r1[1], ridge_z, c, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+    // Gable-end triangle at -axis side. Normal is purely horizontal (vertical wall).
+    {
+        let n = [-axis[0], -axis[1], 0.0];
+        let c = shade_face(n);
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p_a[0], p_a[1], eave_z, c, MAT_BUILDING_WALL));
+        vertices.push(MapVertex::at_height(p_c[0], p_c[1], eave_z, c, MAT_BUILDING_WALL));
+        vertices.push(MapVertex::at_height(r0[0], r0[1], ridge_z, c, MAT_BUILDING_WALL));
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+    // Gable-end triangle at +axis side.
+    {
+        let n = [axis[0], axis[1], 0.0];
+        let c = shade_face(n);
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p_b[0], p_b[1], eave_z, c, MAT_BUILDING_WALL));
+        vertices.push(MapVertex::at_height(p_d[0], p_d[1], eave_z, c, MAT_BUILDING_WALL));
+        vertices.push(MapVertex::at_height(r1[0], r1[1], ridge_z, c, MAT_BUILDING_WALL));
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+}
+
+/// Extrude a thick parapet wall around a building's perimeter:
+/// - Outer face: vertical quads at the polygon's outer XY (base_z → top_z)
+/// - Inner face: vertical quads at an inset XY (base_z → top_z)
+/// - Top rim: horizontal strip at z=top_z connecting outer to inset
+///
+/// Render this after the main wall extrusion (0 → effective_height). The
+/// flat roof at `base_z` appears recessed inside the parapet's interior face
+/// when viewed from above; the top rim gives the parapet visible thickness.
+pub(crate) fn extrude_parapet(
+    coords: &[[f32; 2]],
+    base_z: f32,
+    top_z: f32,
+    thickness: f32,
+    color: [f32; 4],
+    material: f32,
+    vertices: &mut Vec<MapVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let mut pts: Vec<[f32; 2]> = if coords.len() > 1 && coords[0] == coords[coords.len() - 1] {
+        coords[..coords.len() - 1].to_vec()
+    } else {
+        coords.to_vec()
+    };
+    let n = pts.len();
+    if n < 3 || thickness < 1e-6 {
+        return;
+    }
+
+    // Force CCW so inward normals are consistent.
+    if polygon_signed_area(&pts) < 0.0 {
+        pts.reverse();
+    }
+
+    // Inward unit normal per edge (CCW polygon → interior is to the left).
+    let mut edge_normals: Vec<[f32; 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let dx = pts[j][0] - pts[i][0];
+        let dy = pts[j][1] - pts[i][1];
+        let len = (dx * dx + dy * dy).sqrt().max(1e-8);
+        edge_normals.push([-dy / len, dx / len]);
+    }
+
+    // Inset polygon: each vertex moved inward by `thickness` along its bisector.
+    // For thin parapets (small thickness), reflex corners are clamped lightly.
+    let mut inset: Vec<[f32; 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = (i + n - 1) % n;
+        let np = edge_normals[prev];
+        let nc = edge_normals[i];
+        let bx = np[0] + nc[0];
+        let by = np[1] + nc[1];
+        let bl = (bx * bx + by * by).sqrt();
+        if bl < 1e-3 {
+            inset.push([pts[i][0] + np[0] * thickness, pts[i][1] + np[1] * thickness]);
+            continue;
+        }
+        let bis = [bx / bl, by / bl];
+        let half_sin = (bis[0] * np[0] + bis[1] * np[1]).max(0.3);
+        let dist = thickness / half_sin;
+        inset.push([pts[i][0] + bis[0] * dist, pts[i][1] + bis[1] * dist]);
+    }
+
+    let shade_horiz = |nx: f32, ny: f32| -> f32 {
+        let sun_dot = (nx * 0.5 + ny * -0.7).max(0.0);
+        0.6 + sun_dot * 0.4
+    };
+    // Top rim faces +Z; sun direction has Z=0.7 in the pitched-roof shader,
+    // so the rim reads as the brightest face.
+    let top_shade = 0.55 + 0.7 * 0.5;
+    let top_color = [color[0] * top_shade, color[1] * top_shade, color[2] * top_shade, 1.0];
+
+    // Outer face (matches the existing wall plane, so it visually continues the wall).
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let p0 = pts[i];
+        let p1 = pts[j];
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-8 {
+            continue;
+        }
+        // Outward normal of CCW polygon edge: (dy, -dx) / len.
+        let s = shade_horiz(dy / len, -dx / len);
+        let wc = [color[0] * s, color[1] * s, color[2] * s, 1.0];
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p0[0], p0[1], base_z, wc, material));
+        vertices.push(MapVertex::at_height(p1[0], p1[1], base_z, wc, material));
+        vertices.push(MapVertex::at_height(p0[0], p0[1], top_z, wc, material));
+        vertices.push(MapVertex::at_height(p1[0], p1[1], top_z, wc, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    // Inner face (faces the building interior — visible from above looking into the roof).
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let q0 = inset[i];
+        let q1 = inset[j];
+        let dx = q1[0] - q0[0];
+        let dy = q1[1] - q0[1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-8 {
+            continue;
+        }
+        // Inner face outward = inward direction of original polygon = (-dy, dx) / len.
+        let s = shade_horiz(-dy / len, dx / len);
+        let wc = [color[0] * s, color[1] * s, color[2] * s, 1.0];
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(q0[0], q0[1], base_z, wc, material));
+        vertices.push(MapVertex::at_height(q1[0], q1[1], base_z, wc, material));
+        vertices.push(MapVertex::at_height(q0[0], q0[1], top_z, wc, material));
+        vertices.push(MapVertex::at_height(q1[0], q1[1], top_z, wc, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    // Top rim: horizontal strip connecting outer perimeter to inset perimeter at top_z.
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let p0 = pts[i];
+        let p1 = pts[j];
+        let q0 = inset[i];
+        let q1 = inset[j];
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p0[0], p0[1], top_z, top_color, material));
+        vertices.push(MapVertex::at_height(p1[0], p1[1], top_z, top_color, material));
+        vertices.push(MapVertex::at_height(q0[0], q0[1], top_z, top_color, material));
+        vertices.push(MapVertex::at_height(q1[0], q1[1], top_z, top_color, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+}
+
+/// Try to decompose a rectilinear polygon (all edges aligned to two perpendicular
+/// directions, within tolerance) into a set of rectangles using horizontal-strip
+/// decomposition in the polygon's local axis frame. Returns None if the polygon
+/// is not rectilinear or decomposition fails.
+///
+/// Each returned rectangle is a 4-vertex CCW polygon in WORLD coordinates,
+/// suitable for passing to `triangulate_gable_roof`. Sub-rectangles naturally
+/// get different short-axis dimensions, so each gable's ridge height is
+/// proportional to its own short axis — the smaller wing butts into the main.
+pub(crate) fn decompose_rectilinear(polygon: &[[f32; 2]]) -> Option<Vec<Vec<[f32; 2]>>> {
+    let pts: Vec<[f32; 2]> = if polygon.len() > 1 && polygon[0] == polygon[polygon.len() - 1] {
+        polygon[..polygon.len() - 1].to_vec()
+    } else {
+        polygon.to_vec()
+    };
+    let n = pts.len();
+    if n < 4 {
+        return None;
+    }
+
+    // Dominant axis = direction of the longest edge.
+    let mut longest_len = 0.0f32;
+    let mut axis = [1.0f32, 0.0];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let dx = pts[j][0] - pts[i][0];
+        let dy = pts[j][1] - pts[i][1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > longest_len {
+            longest_len = len;
+            axis = [dx / len, dy / len];
+        }
+    }
+    let perp = [-axis[1], axis[0]];
+
+    // Verify rectilinear: each edge is parallel or perpendicular to axis (within ~5°).
+    const ALIGN_TOL: f32 = 0.087; // sin(5°)
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let dx = pts[j][0] - pts[i][0];
+        let dy = pts[j][1] - pts[i][1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            continue;
+        }
+        let dot = ((dx / len) * axis[0] + (dy / len) * axis[1]).abs();
+        // Aligned with axis: dot ≈ 1; perpendicular: dot ≈ 0.
+        if dot > ALIGN_TOL && dot < 1.0 - ALIGN_TOL {
+            return None;
+        }
+    }
+
+    // Rotate to (axis, perp) frame so axis-aligned ↔ X/Y-aligned.
+    let rotated: Vec<[f32; 2]> = pts.iter().map(|p| [
+        p[0] * axis[0] + p[1] * axis[1],
+        p[0] * perp[0] + p[1] * perp[1],
+    ]).collect();
+
+    // Sorted, deduplicated Y values define horizontal strip boundaries.
+    let mut ys: Vec<f32> = rotated.iter().map(|p| p[1]).collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut dedup: Vec<f32> = Vec::with_capacity(ys.len());
+    for y in ys {
+        if dedup.last().map_or(true, |&last: &f32| (y - last).abs() > 1e-5) {
+            dedup.push(y);
+        }
+    }
+    if dedup.len() < 2 {
+        return None;
+    }
+
+    let mut rects: Vec<Vec<[f32; 2]>> = Vec::new();
+    for k in 0..dedup.len() - 1 {
+        let y_lo = dedup[k];
+        let y_hi = dedup[k + 1];
+        let y_mid = (y_lo + y_hi) * 0.5;
+
+        // X-axis crossings: each strictly-spanning edge contributes one crossing.
+        let mut crossings: Vec<f32> = Vec::new();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let p0 = rotated[i];
+            let p1 = rotated[j];
+            let y0 = p0[1].min(p1[1]);
+            let y1 = p0[1].max(p1[1]);
+            if y_mid > y0 && y_mid < y1 {
+                let t = (y_mid - p0[1]) / (p1[1] - p0[1]);
+                let x = p0[0] + t * (p1[0] - p0[0]);
+                crossings.push(x);
+            }
+        }
+        crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Each consecutive pair of crossings bounds an interior interval.
+        let mut idx = 0;
+        while idx + 1 < crossings.len() {
+            let x_lo = crossings[idx];
+            let x_hi = crossings[idx + 1];
+            if x_hi > x_lo + 1e-5 {
+                let unrotate = |p: [f32; 2]| -> [f32; 2] {
+                    [p[0] * axis[0] + p[1] * perp[0], p[0] * axis[1] + p[1] * perp[1]]
+                };
+                rects.push(vec![
+                    unrotate([x_lo, y_lo]),
+                    unrotate([x_hi, y_lo]),
+                    unrotate([x_hi, y_hi]),
+                    unrotate([x_lo, y_hi]),
+                ]);
+            }
+            idx += 2;
+        }
+    }
+
+    if rects.is_empty() {
+        None
+    } else {
+        Some(rects)
+    }
+}
+
+/// Build a complex pitched roof using a single-pass straight-skeleton inset.
+/// Each polygon edge slopes inward to a contracted "ridge contour" at ridge_z,
+/// then the contour is capped flat. Handles arbitrary rectilinear polygons —
+/// L-shapes, T-shapes, rectangle-with-bump-out — without overhanging the wall
+/// footprint. Reflex (concave) corners are clamped via a minimum bisector
+/// projection so they don't produce runaway spikes.
+///
+/// This is NOT the full straight skeleton algorithm; it's one inset pass.
+/// Works well for shapes whose narrowest dimension exceeds the inset distance.
+pub(crate) fn triangulate_skeleton_roof(
+    coords: &[[f32; 2]],
+    eave_z: f32,
+    ridge_z: f32,
+    color: [f32; 4],
+    material: f32,
+    vertices: &mut Vec<MapVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let mut pts: Vec<[f32; 2]> = if coords.len() > 1 && coords[0] == coords[coords.len() - 1] {
+        coords[..coords.len() - 1].to_vec()
+    } else {
+        coords.to_vec()
+    };
+    let n = pts.len();
+    if n < 4 {
+        return;
+    }
+
+    // Force CCW winding — inward normals (computed below) only point into the
+    // polygon when the ring runs CCW. MVT polygons can come in either winding.
+    if polygon_signed_area(&pts) < 0.0 {
+        pts.reverse();
+    }
+
+    // Inset distance: ~half the OBB short axis so the ridge contour is well-formed
+    // even for slightly-non-rectangular polygons.
+    let (_, _, _, half_short) = oriented_bbox(&pts);
+    if half_short < 1e-4 {
+        return;
+    }
+    let inset_distance = (half_short * 0.55).min(0.5);
+
+    // Inward unit normal for each edge (CCW polygon: interior is to the left).
+    let mut edge_normals: Vec<[f32; 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let dx = pts[j][0] - pts[i][0];
+        let dy = pts[j][1] - pts[i][1];
+        let len = (dx * dx + dy * dy).sqrt().max(1e-8);
+        edge_normals.push([-dy / len, dx / len]);
+    }
+
+    // Compute inset position for each vertex.
+    // - Convex corner (left turn in CCW): inset along the inward bisector.
+    // - Reflex corner (right turn): keep the vertex in place. Insetting along the
+    //   bisector at a reflex corner pushes OUTSIDE the polygon, which previously
+    //   produced "roofs floating in space" near L/T-shape inner corners.
+    let mut inset_pts: Vec<[f32; 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev_idx = (i + n - 1) % n;
+        let p_prev = pts[prev_idx];
+        let p_curr = pts[i];
+        let p_next = pts[(i + 1) % n];
+        let e_in = [p_curr[0] - p_prev[0], p_curr[1] - p_prev[1]];
+        let e_out = [p_next[0] - p_curr[0], p_next[1] - p_curr[1]];
+        let cross = e_in[0] * e_out[1] - e_in[1] * e_out[0];
+        // CCW polygon: positive cross = convex; negative = reflex.
+        if cross < 0.0 {
+            inset_pts.push(p_curr);
+            continue;
+        }
+
+        let np = edge_normals[prev_idx];
+        let nc = edge_normals[i];
+        let bx = np[0] + nc[0];
+        let by = np[1] + nc[1];
+        let bl = (bx * bx + by * by).sqrt();
+        if bl < 1e-3 {
+            // Edges nearly antiparallel — drop the vertex straight inward.
+            inset_pts.push([
+                p_curr[0] + np[0] * inset_distance,
+                p_curr[1] + np[1] * inset_distance,
+            ]);
+            continue;
+        }
+        let bis = [bx / bl, by / bl];
+        // dot(bisector, prev_inward_normal) = sin(half-interior-angle); clamp at
+        // sin(half) ≥ 0.3 (interior ≥ ~35°) to avoid runaway at acute corners.
+        let half_sin = (bis[0] * np[0] + bis[1] * np[1]).max(0.3);
+        let dist = inset_distance / half_sin;
+        inset_pts.push([
+            p_curr[0] + bis[0] * dist,
+            p_curr[1] + bis[1] * dist,
+        ]);
+    }
+
+    // Per-vertex ridge height: proportional to the inset point's distance from
+    // any *non-adjacent* polygon edge. The main body's inset points are far
+    // from far edges → full ridge. Wings/bump-outs have inset points close to
+    // their narrow channel → tapered ridge. The slopes naturally butt into the
+    // main pitch at the right intersection.
+    let rise = ridge_z - eave_z;
+    let mut inset_z: Vec<f32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let q = inset_pts[i];
+        let prev_edge = (i + n - 1) % n;
+        let mut min_far_dist = f32::INFINITY;
+        for j in 0..n {
+            // Skip the two polygon edges that touch vertex i.
+            if j == prev_edge || j == i {
+                continue;
+            }
+            let a = pts[j];
+            let b = pts[(j + 1) % n];
+            let d = point_to_segment_distance(q, a, b);
+            if d < min_far_dist {
+                min_far_dist = d;
+            }
+        }
+        let ratio = if min_far_dist.is_finite() {
+            (min_far_dist / inset_distance).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        inset_z.push(eave_z + rise * ratio);
+    }
+
+    let sun = [0.5f32, -0.5, 0.7];
+
+    // Sloped face per footprint edge.
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let p0 = pts[i];
+        let p1 = pts[j];
+        let q0 = inset_pts[i];
+        let q1 = inset_pts[j];
+        let q0z = inset_z[i];
+        let q1z = inset_z[j];
+
+        // Face normal uses the average rise across this edge so adjacent slopes
+        // get distinguishable shading even when their ridge heights differ.
+        let avg_rise = ((q0z + q1z) * 0.5 - eave_z).max(0.0);
+        let nin = edge_normals[i];
+        let nx = -nin[0] * avg_rise;
+        let ny = -nin[1] * avg_rise;
+        let nz = inset_distance;
+        let nl = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-8);
+        let (nxn, nyn, nzn) = (nx / nl, ny / nl, nz / nl);
+        let sun_dot = (nxn * sun[0] + nyn * sun[1] + nzn * sun[2]).max(0.0);
+        let s = 0.55 + sun_dot * 0.5;
+        let c = [color[0] * s, color[1] * s, color[2] * s, 1.0];
+
+        let base = vertices.len() as u32;
+        vertices.push(MapVertex::at_height(p0[0], p0[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(p1[0], p1[1], eave_z, c, material));
+        vertices.push(MapVertex::at_height(q0[0], q0[1], q0z, c, material));
+        vertices.push(MapVertex::at_height(q1[0], q1[1], q1z, c, material));
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    // Cap the ridge contour. Triangulate in 2D, then emit with per-vertex z so
+    // the cap follows the varying ridge heights computed above.
+    let cap_dot = sun[2].max(0.0);
+    let cap_s = 0.55 + cap_dot * 0.5;
+    let cap_c = [color[0] * cap_s, color[1] * cap_s, color[2] * cap_s, 1.0];
+    let flat: Vec<f64> = inset_pts.iter().flat_map(|p| [p[0] as f64, p[1] as f64]).collect();
+    if let Ok(tri_indices) = earcutr::earcut(&flat, &[], 2) {
+        let base = vertices.len() as u32;
+        for (k, p) in inset_pts.iter().enumerate() {
+            vertices.push(MapVertex::at_height(p[0], p[1], inset_z[k], cap_c, material));
+        }
+        for idx in tri_indices {
+            indices.push(base + idx as u32);
+        }
+    }
+}
+
+/// Shortest distance from a point to a 2D line segment.
+fn point_to_segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-12 {
+        let ax = p[0] - a[0];
+        let ay = p[1] - a[1];
+        return (ax * ax + ay * ay).sqrt();
+    }
+    let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len_sq).clamp(0.0, 1.0);
+    let proj_x = a[0] + t * dx;
+    let proj_y = a[1] + t * dy;
+    let ex = p[0] - proj_x;
+    let ey = p[1] - proj_y;
+    (ex * ex + ey * ey).sqrt()
 }
 
 /// Generate line geometry at a given height (for roof edge outlines).
@@ -1719,17 +2459,18 @@ pub(crate) fn generate_tree(
     let trunk_radius = 0.03 * scale;
     let trunk_height = 0.38 * scale;
 
-    // Trunk cylinder
+    // Trunk cylinder — 6 segments instead of 8 (24% vert reduction).
     generate_cylinder(
         pos, trunk_radius, 0.0, trunk_height,
         COLOR_TREE_TRUNK, MAT_TREE_TRUNK,
-        8, vertices, indices,
+        6, vertices, indices,
     );
 
-    // 3 foliage spheres, stacked and offset — wide canopy
-    let sphere_radius_bottom = 0.24 * scale;
-    let sphere_radius_mid = 0.20 * scale;
-    let sphere_radius_top = 0.15 * scale;
+    // 2 foliage spheres (was 3) — bottom + offset top. Drops one entire sphere
+    // (~50 verts) and shrinks each remaining sphere to 6×4 segments instead
+    // of 8×6 (drops verts per sphere from 50→26).
+    let sphere_radius_bottom = 0.26 * scale;
+    let sphere_radius_top = 0.18 * scale;
 
     // Offset variation per tree
     let hash2 = ((pos[0] * 269.3 + pos[1] * 183.1).sin() * 27183.2847).fract();
@@ -1739,29 +2480,23 @@ pub(crate) fn generate_tree(
     // Bottom sphere — centered on trunk
     generate_sphere(
         [pos[0], pos[1]],
-        0.20 * scale,
+        0.22 * scale,
         sphere_radius_bottom,
         COLOR_TREE_LEAVES, MAT_TREE_LEAVES,
-        8, 6, vertices, indices,
+        6, 4, vertices, indices,
     );
 
-    // Middle sphere — offset slightly
+    // Top sphere — offset slightly for organic shape
     generate_sphere(
-        [pos[0] + 0.04 * scale + ox, pos[1] + 0.02 * scale + oy],
-        0.32 * scale,
-        sphere_radius_mid,
-        COLOR_TREE_LEAVES, MAT_TREE_LEAVES,
-        8, 6, vertices, indices,
-    );
-
-    // Top sphere — offset the other direction
-    generate_sphere(
-        [pos[0] - 0.02 * scale - ox, pos[1] + 0.01 * scale - oy],
-        0.42 * scale,
+        [pos[0] + 0.03 * scale + ox, pos[1] + 0.02 * scale + oy],
+        0.40 * scale,
         sphere_radius_top,
         COLOR_TREE_LEAVES, MAT_TREE_LEAVES,
-        8, 6, vertices, indices,
+        6, 4, vertices, indices,
     );
+
+    // (Net per tree: ~12 trunk verts + ~26 verts × 2 spheres = ~64 verts,
+    // down from ~166 verts before.)
 }
 
 /// Generate a UV sphere centered at (cx, cy, cz) with given radius.

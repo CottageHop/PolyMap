@@ -1,5 +1,5 @@
 // PolyMap — 3D Procedurally Textured Map Shader
-// Materials: 0=default, 1=asphalt, 2=building roof, 3=grass, 4=water, 5=building wall, 6=tree leaves, 7=tree trunk, 8=cobblestone, 9=glass roof, 10=glass wall, 11=fountain
+// Materials: 0=default, 1=asphalt, 2=building roof, 3=grass, 4=water, 5=building wall, 6=tree leaves, 7=tree trunk, 8=cobblestone, 9=glass roof, 10=glass wall, 11=fountain, 19=pitched roof shingles
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -10,7 +10,7 @@ struct CameraUniform {
     tilt: f32,
     cloud_opacity: f32,
     cloud_speed: f32,
-    _pad2a: f32,
+    label_alpha: f32,
     _pad2b: f32,
     _pad2c: f32,
     water_tint: vec4<f32>,
@@ -18,6 +18,7 @@ struct CameraUniform {
     building_tint: vec4<f32>,
     road_tint: vec4<f32>,
     land_tint: vec4<f32>,
+    rail_tint: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -32,6 +33,10 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) material: f32,
+    // Per-vertex tile birth time, in seconds since app start. Comes from a
+    // parallel vertex buffer (same vertex count). Used by the fragment shader
+    // to fade the tile in smoothly on load.
+    @location(3) birth_time: f32,
 };
 
 struct VertexOutput {
@@ -39,6 +44,7 @@ struct VertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) world_pos: vec3<f32>,
     @location(2) material: f32,
+    @location(3) birth_time: f32,
 };
 
 @vertex
@@ -48,6 +54,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
     out.world_pos = in.position;
     out.material = in.material;
+    out.birth_time = in.birth_time;
 
     // Subtle vertex AO: only brighten roofs, don't darken bases
     // (darkening bases causes visible artifacts at tile boundaries)
@@ -62,6 +69,16 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.color = vc;
 
     return out;
+}
+
+// Tile fade-in: ramps from 0 → 1 over ~400 ms from each vertex's birth time.
+// If birth_time is 0 (legacy/single-shot path) the tile is always fully visible.
+fn tile_fade(birth_time: f32, now: f32) -> f32 {
+    if birth_time <= 0.0 {
+        return 1.0;
+    }
+    let age = now - birth_time;
+    return smoothstep(0.0, 0.4, age);
 }
 
 // ============================================================
@@ -242,18 +259,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let orig_lum = dot(color, vec3<f32>(0.299, 0.587, 0.114));
     let is_water = mat == 4 || mat == 11;
     let is_park = mat == 3 || mat == 6;
-    let is_building = mat == 2 || mat == 5 || mat == 9 || mat == 10;
+    let is_building = mat == 2 || mat == 5 || mat == 9 || mat == 10 || mat == 19;
     let is_road = mat == 1 || mat == 8;
-    let is_land = !is_water && !is_park && !is_building && !is_road
-                  && mat != 12 && mat != 13; // exclude clouds and pins
+    let is_rail = mat == 17 || mat == 18; // MAT_RAIL | MAT_RAIL_TIE
+    let is_land = !is_water && !is_park && !is_building && !is_road && !is_rail
+                  && mat != 12; // exclude clouds
 
-    if camera.water_tint.a > 0.5 && is_water {
+    if camera.rail_tint.a > 0.5 && is_rail {
+        // Ties auto-darken to ~0.7× of the picked rail color so the
+        // tie/rail contrast stays even with a single user-chosen hue.
+        if mat == 18 {
+            color = camera.rail_tint.rgb * 0.7;
+        } else {
+            color = camera.rail_tint.rgb;
+        }
+    } else if camera.water_tint.a > 0.5 && is_water {
         color = camera.water_tint.rgb;
     } else if camera.park_tint.a > 0.5 && is_park {
         color = camera.park_tint.rgb;
     } else if camera.building_tint.a > 0.5 && is_building {
         let tint = camera.building_tint.rgb;
-        if mat == 5 || mat == 10 {
+        // Mat 5/10 (walls) and 19 (pitched-roof slopes) carry baked per-face
+        // shading in the vertex color. Preserve relative luminance so the
+        // dashboard tint colors the building without flattening the shading.
+        if mat == 5 || mat == 10 || mat == 19 {
             let tint_lum = max(dot(tint, vec3<f32>(0.299, 0.587, 0.114)), 0.01);
             color = tint * (orig_lum / tint_lum);
         } else {
@@ -370,10 +399,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let stone = noise2(uv * 2.0) * 0.04;
             color = color + vec3<f32>(stone);
         }
-        case 13: {
-            // Pin marker — glossy with subtle highlight
-            let highlight = smoothstep(0.3, 0.7, in.world_pos.z / 0.5) * 0.15;
-            color = color + vec3<f32>(highlight);
+        case 19: {
+            // Pitched roof — shingle/seam pattern keyed off world-space height
+            // so courses run horizontally on the slope. Vertex color carries
+            // per-face shading from triangulate_hip_roof.
+            let row = floor(in.world_pos.z * 80.0);
+            let row_offset = fract(row * 0.5);
+            let across = in.world_pos.x + in.world_pos.y;
+            let stagger = fract(across * 12.0 + row_offset);
+            let course = smoothstep(0.0, 0.05, fract(in.world_pos.z * 80.0))
+                       * smoothstep(0.0, 0.05, 1.0 - fract(in.world_pos.z * 80.0));
+            let seam = smoothstep(0.0, 0.04, stagger) * smoothstep(0.0, 0.04, 1.0 - stagger);
+            let shingle = mix(-0.06, 0.02, course * seam);
+            let weather = noise2(in.world_pos.xy * 30.0) * 0.04;
+            color = color + vec3<f32>(shingle + weather);
         }
         default: {
             let subtle = noise2(in.world_pos.xy * 20.0) * 0.015;
@@ -392,23 +431,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fog_factor = smoothstep(0.85, 1.3, screen_dist) * 0.7; // starts near edge, 70% at corners
     color = mix(color, fog_color, fog_factor);
 
-    return vec4<f32>(color, in.color.a);
+    let fade = tile_fade(in.birth_time, camera.time);
+    return vec4<f32>(color, in.color.a * fade);
 }
 
 // Shadow/overlay fragment shader — handles both shadows (black+alpha) and clouds (white+alpha)
 @fragment
 fn fs_shadow(in: VertexOutput) -> @location(0) vec4<f32> {
     let mat = i32(round(in.material));
+    let fade = tile_fade(in.birth_time, camera.time);
     if mat == 12 {
         // Cloud: white with vertex alpha, slight animated variation
         let drift = vec2<f32>(camera.time * 0.06, camera.time * 0.04);
         let uv = in.world_pos.xy * 0.3 + drift;
         let density = fbm3(uv) * 0.4 + 0.6;
-        let alpha = in.color.a * density;
+        let alpha = in.color.a * density * fade;
         return vec4<f32>(1.0, 1.0, 1.0, alpha);
     }
     // Shadow: black with vertex alpha
-    return vec4<f32>(0.0, 0.0, 0.0, in.color.a);
+    return vec4<f32>(0.0, 0.0, 0.0, in.color.a * fade);
 }
 
 // ============================================================
