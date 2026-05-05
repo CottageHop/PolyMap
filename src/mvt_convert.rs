@@ -257,38 +257,40 @@ pub fn mvt_to_mapdata(
     const TREE_TILE_BUDGET: usize = 250;        // hard cap per tile
     const TREE_PER_POLY_CAP: usize = 25;        // hard cap per polygon
     const TREE_DENSITY_DENOM: f32 = 0.10;       // ~1 tree per 110 m² (was 44 m²)
-    for (coords, _name) in &park_polys {
-        if tree_positions.len() >= TREE_TILE_BUDGET {
-            break;
+    if detail >= DetailLevel::High {
+        for (coords, _name) in &park_polys {
+            if tree_positions.len() >= TREE_TILE_BUDGET {
+                break;
+            }
+            let area = polygon_signed_area(coords).abs();
+            if area < 0.005 {
+                continue;
+            }
+            let remaining_budget = TREE_TILE_BUDGET.saturating_sub(tree_positions.len());
+            let target = ((area / TREE_DENSITY_DENOM) as usize)
+                .clamp(2, TREE_PER_POLY_CAP)
+                .min(remaining_budget);
+            scatter_trees_in_polygon(coords, target, &mut tree_positions);
         }
-        let area = polygon_signed_area(coords).abs();
-        if area < 0.005 {
-            continue;
-        }
-        let remaining_budget = TREE_TILE_BUDGET.saturating_sub(tree_positions.len());
-        let target = ((area / TREE_DENSITY_DENOM) as usize)
-            .clamp(2, TREE_PER_POLY_CAP)
-            .min(remaining_budget);
-        scatter_trees_in_polygon(coords, target, &mut tree_positions);
-    }
 
-    // Detect fountains in the water layer: small + circular water polygons that
-    // weren't tagged as POIs. Same heuristic as the Overpass JSON path.
-    for coords in &water_polys {
-        if coords.len() < 4 {
-            continue;
-        }
-        let area = polygon_signed_area(coords).abs();
-        if area > FOUNTAIN_MAX_AREA {
-            continue;
-        }
-        let perim = polygon_perimeter(coords);
-        if perim < 1e-6 {
-            continue;
-        }
-        let circularity = (4.0 * std::f32::consts::PI * area) / (perim * perim);
-        if circularity >= FOUNTAIN_MIN_CIRCULARITY {
-            fountain_positions.push(mapdata::polygon_centroid(coords));
+        // Detect fountains in the water layer: small + circular water polygons that
+        // weren't tagged as POIs. Same heuristic as the Overpass JSON path.
+        for coords in &water_polys {
+            if coords.len() < 4 {
+                continue;
+            }
+            let area = polygon_signed_area(coords).abs();
+            if area > FOUNTAIN_MAX_AREA {
+                continue;
+            }
+            let perim = polygon_perimeter(coords);
+            if perim < 1e-6 {
+                continue;
+            }
+            let circularity = (4.0 * std::f32::consts::PI * area) / (perim * perim);
+            if circularity >= FOUNTAIN_MIN_CIRCULARITY {
+                fountain_positions.push(mapdata::polygon_centroid(coords));
+            }
         }
     }
 
@@ -352,7 +354,7 @@ pub fn mvt_to_mapdata(
     building_polys.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     // Layer 3.5: Building shadows
-    {
+    if detail >= DetailLevel::High {
     for (coords, _, height, _mask) in &building_polys {
         let height_z = height / 11.1;
         if !is_closed(coords) || coords.len() < 4 {
@@ -433,6 +435,10 @@ pub fn mvt_to_mapdata(
     } // end High-detail shadow block
 
     // Layer 4: Buildings (sorted by height above)
+    // Note: gated on Medium+ for the underlay use case (Low skips buildings entirely).
+    // Medium and High currently produce identical 3D output; if a flat-footprint-only
+    // Medium tier is needed later, split the wall+roof code below behind a High gate.
+    if detail >= DetailLevel::Medium {
     for (coords, name, height, _boundary_mask) in &building_polys {
         let height_z = height / 11.1;
         let (base_color, roof_mat, wall_mat) = (COLOR_BUILDING, MAT_BUILDING, MAT_BUILDING_WALL);
@@ -569,9 +575,10 @@ pub fn mvt_to_mapdata(
             });
         }
     }
+    } // end Medium+ building block
 
-    // Layer 5: Sidewalks / footpaths (outline pass) — all detail levels
-    {
+    // Layer 5: Sidewalks / footpaths (outline pass) — Medium+ only.
+    if detail >= DetailLevel::Medium {
     for (coords, road_type, name) in &road_lines {
         if !matches!(road_type, RoadType::Path) {
             continue;
@@ -801,17 +808,22 @@ pub fn mvt_to_mapdata(
         }
     }
 
-    // Layer 10: Fountains
-    for pos in &fountain_positions {
-        generate_fountain(*pos, Z_WATER, &mut vertices, &mut indices);
+    // Layer 10: Fountains (High only)
+    if detail >= DetailLevel::High {
+        for pos in &fountain_positions {
+            generate_fountain(*pos, Z_WATER, &mut vertices, &mut indices);
+        }
     }
 
     // Layer 11: Trees (placed at OSM `natural=tree` node positions from the pois layer).
-    for pos in &tree_positions {
-        generate_tree_shadow(*pos, &mut shadow_vertices, &mut shadow_indices);
-    }
-    for pos in &tree_positions {
-        generate_tree(*pos, &mut vertices, &mut indices);
+    // High only — tree meshes are ~90 verts each, hundreds per tile.
+    if detail >= DetailLevel::High {
+        for pos in &tree_positions {
+            generate_tree_shadow(*pos, &mut shadow_vertices, &mut shadow_indices);
+        }
+        for pos in &tree_positions {
+            generate_tree(*pos, &mut vertices, &mut indices);
+        }
     }
 
 
@@ -838,6 +850,7 @@ pub fn mvt_to_mapdata(
         [0.90, 0.90, 0.90], // white
         [0.25, 0.55, 0.30], // green
     ];
+    if detail >= DetailLevel::High {
     for (coords, road_type, _) in &road_lines {
         if matches!(road_type, RoadType::Path | RoadType::Rail) { continue; }
         if coords.len() < 2 { continue; }
@@ -873,11 +886,13 @@ pub fn mvt_to_mapdata(
             });
         }
     }
+    } // end High-detail cars block
 
     // Noise heat-map sources. Sample point features along line geometry at a
     // coarse spacing — enough to cover the road/rail but not so dense we
     // over-saturate the 128-slot GPU budget.
     let mut noise_sources: Vec<crate::mapdata::NoiseSource> = Vec::new();
+    if detail >= DetailLevel::High {
     let sample_line = |coords: &[[f32; 2]], spacing: f32, db: f32, out: &mut Vec<crate::mapdata::NoiseSource>| {
         if coords.len() < 2 { return; }
         let mut walked = 0.0_f32;
@@ -911,6 +926,7 @@ pub fn mvt_to_mapdata(
             noise_sources.push(crate::mapdata::NoiseSource { pos: c, db: 55.0, _pad: 0.0 });
         }
     }
+    } // end High-detail noise sources block
 
     MapData {
         vertices,

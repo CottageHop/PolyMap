@@ -15,6 +15,11 @@ pub struct PolyMapConfig {
     pub parcels_url: Option<String>,
     pub colors: Option<ColorConfig>,
     pub layers: Option<LayerConfig>,
+    /// If `Some(z)`, fetch lower-zoom MVT tiles (at zoom `z`) at `DetailLevel::Low`
+    /// and render them as a themed base layer beneath the z14 high-res tiles.
+    /// Provides a fast, theme-tinted first paint while high-res streams in.
+    /// Recommended value: `Some(11)`.
+    pub low_res_underlay: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

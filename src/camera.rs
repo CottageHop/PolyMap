@@ -47,7 +47,12 @@ pub struct CameraUniform {
     /// Label opacity multiplier. Dimmed during camera motion to hide
     /// the lag between zoom change and label rebuild.
     pub label_alpha: f32,
-    pub _pad2: [f32; 2],
+    /// Extra opacity multiplier applied only to small-kind labels (street,
+    /// building, POI, park). Eased to 0.0 when zoom drops below
+    /// `LOW_ZOOM_THRESHOLD` so street names fade out alongside the z14 tiles.
+    /// Large labels (state, city, district, marker) are unaffected.
+    pub small_label_alpha: f32,
+    pub _pad2: f32,
     /// Color tints — when alpha > 0.5, replaces the base vertex color for that material
     pub water_tint: [f32; 4],
     pub park_tint: [f32; 4],
@@ -71,7 +76,8 @@ impl Default for CameraUniform {
             cloud_opacity: 1.0,
             cloud_speed: 1.0,
             label_alpha: 1.0,
-            _pad2: [0.0; 2],
+            small_label_alpha: 1.0,
+            _pad2: 0.0,
             water_tint: [0.0; 4],
             park_tint: [0.0; 4],
             building_tint: [0.0; 4],
@@ -227,7 +233,8 @@ impl Camera {
             cloud_opacity: 1.0,
             cloud_speed: 1.0,
             label_alpha: 1.0,
-            _pad2: [0.0; 2],
+            small_label_alpha: 1.0,
+            _pad2: 0.0,
             water_tint: [0.0; 4],
             park_tint: [0.0; 4],
             building_tint: [0.0; 4],

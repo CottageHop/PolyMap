@@ -57,6 +57,9 @@ pub struct App {
     camera: Camera,
     map_data: Option<MapData>,
     tile_manager: Option<tiles::TileManager>,
+    /// Optional low-resolution underlay (wasm only, opt-in via PolyMapConfig).
+    #[cfg(target_arch = "wasm32")]
+    base_tile_manager: Option<tiles::BaseTileManager>,
     use_tiles: bool,
     start_time: Instant,
     last_frame: Instant,
@@ -83,6 +86,11 @@ pub struct App {
     /// fade out while the camera is moving (hiding the lag between the
     /// gesture and the rebuild) and fade back in once the camera settles.
     label_fade: f32,
+    /// Extra opacity multiplier for "small" labels (street/building/poi/park)
+    /// only. Eased toward 0.0 when zoom drops below `LOW_ZOOM_THRESHOLD` so
+    /// street names fade out alongside the z14 tile geometry; eased back to
+    /// 1.0 when zoom returns. Large place names are unaffected.
+    small_label_fade: f32,
     /// Frames since GPU was initialized — used to re-sync canvas size on WASM
     frames_since_gpu_init: u32,
     #[cfg(target_arch = "wasm32")]
@@ -115,6 +123,8 @@ impl App {
             camera: Camera::new(800.0, 600.0),
             map_data,
             tile_manager: None,
+            #[cfg(target_arch = "wasm32")]
+            base_tile_manager: None,
             use_tiles,
             start_time: Instant::now(),
             last_frame: Instant::now(),
@@ -138,6 +148,7 @@ impl App {
             frames_since_camera_moved: 0,
             first_render_done: false,
             label_fade: 1.0,
+            small_label_fade: 1.0,
             frames_since_gpu_init: 0,
             #[cfg(target_arch = "wasm32")]
             gpu_pending: None,
@@ -378,11 +389,12 @@ impl App {
                             let num_indices = indices.len() as u32;
 
                             // Parallel birth-time buffer for tile fade-in.
+                            // COPY_DST lets start_death / cancel_death rewrite it in-place.
                             let now_secs = (Instant::now() - self.start_time).as_secs_f32();
                             let birth_data: Vec<f32> = vec![now_secs; num_verts.max(1)];
                             let birth_buffer = crate::gpu::safe_buffer(
                                 &gpu.device, &gpu.queue, "Worker Tile Birth VB",
-                                bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX,
+                                bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                             );
 
                             // Shadow buffers (optional)
@@ -394,7 +406,7 @@ impl App {
                                 let shadow_birth: Vec<f32> = vec![now_secs; num_shadow_verts.max(1)];
                                 let sbb = crate::gpu::safe_buffer(
                                     &gpu.device, &gpu.queue, "Worker Tile Shadow Birth VB",
-                                    bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX,
+                                    bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                                 );
                                 let sib = crate::gpu::safe_buffer(
                                     &gpu.device, &gpu.queue, "Worker Tile Shadow Index Buffer",
@@ -439,6 +451,9 @@ impl App {
                                 noise_sources: noise_vec,
                                 last_visible_frame: 0,
                                 z14_tile: z14,
+                                vertex_count: num_verts as u32,
+                                shadow_vertex_count: num_shadow_verts as u32,
+                                death_time: None,
                             };
 
                             // Ensure tile_manager exists
@@ -812,9 +827,26 @@ impl ApplicationHandler for App {
                         self.tile_manager = Some(tiles::TileManager::new(clat, clon));
                     }
 
+                    // Initialize base-tile underlay if configured.
+                    #[cfg(target_arch = "wasm32")]
+                    if self.base_tile_manager.is_none() {
+                        let underlay_zoom = api::INIT_CONFIG.with(|c| {
+                            c.borrow().as_ref().and_then(|cfg| cfg.low_res_underlay)
+                        });
+                        if let Some(z) = underlay_zoom {
+                            let (clat, clon) = self.get_start_center();
+                            self.base_tile_manager = Some(tiles::BaseTileManager::new(clat, clon, z));
+                        }
+                    }
+
                     if let (Some(gpu), Some(tm)) = (&self.gpu, &mut self.tile_manager) {
                         // Always poll for completed tiles (cheap — just checks a channel)
                         tm.poll_completed(gpu, elapsed);
+                        // Zoom-aware fade-out: if camera zoomed below threshold,
+                        // start fade-out + skip new fetches; if zoomed back in,
+                        // cancel fades. Cheap unless zoom state actually flipped.
+                        tm.update_zoom_state(gpu, self.camera.zoom, elapsed);
+                        tm.evict_dead_tiles(elapsed);
 
                         // Expensive tile work (visibility calc, requests, eviction):
                         // Run every 10th frame to keep panning smooth, but always on first 3 frames
@@ -839,13 +871,40 @@ impl ApplicationHandler for App {
                         let should_rebuild = self.labels_dirty && camera_settled;
 
                         if should_rebuild {
-                            let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
+                            // While zoomed out: z14 tiles are dying so their
+                            // Street/Building/POI labels are absent from
+                            // `tm.all_labels()` — but pull large place labels
+                            // (State/City/District) from the base z11 tiles so
+                            // the map keeps its bearings. Small labels still in
+                            // the buffer from before the transition fade out
+                            // smoothly via `small_label_alpha` in the shader.
+                            let mut label_refs: Vec<crate::mapdata::Label> =
+                                tm.all_labels().into_iter().cloned().collect();
+                            #[cfg(target_arch = "wasm32")]
+                            if tm.low_zoom_active {
+                                if let Some(btm) = &self.base_tile_manager {
+                                    label_refs.extend(btm.large_labels().into_iter().cloned());
+                                }
+                            }
                             let viewport_min = gpu.size.width.min(gpu.size.height) as f32;
                             if let Some(renderer) = &mut self.renderer {
                                 renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint, viewport_min);
                             }
                             self.last_label_zoom = self.camera.zoom;
                             self.labels_dirty = false;
+                        }
+                    }
+
+                    // Base-tile underlay: poll completion and fetch on the same throttle.
+                    #[cfg(target_arch = "wasm32")]
+                    if let (Some(gpu), Some(btm)) = (&self.gpu, &mut self.base_tile_manager) {
+                        btm.poll_completed(gpu, elapsed);
+                        let frame = btm.frame_counter;
+                        btm.frame_counter += 1;
+                        if frame % 10 == 0 || frame < 3 {
+                            let visible = btm.visible_tiles(&self.camera);
+                            btm.request_visible_tiles(&visible);
+                            btm.update_visibility(&visible);
                         }
                     }
                 }
@@ -940,6 +999,8 @@ impl ApplicationHandler for App {
                     let has_markers = !self.markers.is_empty();
                     let has_loading_tiles = self.use_tiles && self.tile_manager.as_ref()
                         .map_or(false, |tm| tm.tiles.values().any(|s| matches!(s, crate::tiles::TileState::Loading)));
+                    let has_dying_tiles = self.use_tiles && self.tile_manager.as_ref()
+                        .map_or(false, |tm| tm.has_dying_tiles());
                     let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
                     let cars_animating = self.layer_visibility.cars && self.use_tiles && self.tile_manager.as_ref()
                         .map_or(false, |tm| tm.loaded_tiles().any(|t| !t.cars.is_empty()));
@@ -952,6 +1013,7 @@ impl ApplicationHandler for App {
                         || self.labels_dirty
                         || has_markers
                         || has_loading_tiles
+                        || has_dying_tiles
                         || !self.ready_emitted
                         || !self.first_render_done
                         || self.frames_since_gpu_init < 300
@@ -969,10 +1031,17 @@ impl ApplicationHandler for App {
                     let label_target = if self.frames_since_camera_moved <= 10 { 0.4 } else { 1.0 };
                     self.label_fade += (label_target - self.label_fade) * 0.3;
 
+                    // Small-label fade — ramp 0/1 in sync with low_zoom_active.
+                    // 0.05 ease ≈ ~600ms half-life, matching the tile FADE_OUT_DURATION.
+                    let small_label_target = if self.tile_manager.as_ref()
+                        .map_or(false, |tm| tm.low_zoom_active) { 0.0 } else { 1.0 };
+                    self.small_label_fade += (small_label_target - self.small_label_fade) * 0.05;
+
                     let mut uniform = self.camera.uniform(elapsed);
                     uniform.cloud_opacity = self.cloud_opacity;
                     uniform.cloud_speed = self.cloud_speed;
                     uniform.label_alpha = self.label_fade;
+                    uniform.small_label_alpha = self.small_label_fade;
                     uniform.water_tint = self.water_tint;
                     uniform.park_tint = self.park_tint;
                     uniform.building_tint = self.building_tint;
@@ -994,7 +1063,21 @@ impl ApplicationHandler for App {
                     let render_result = if self.use_tiles {
                         if let Some(tm) = &self.tile_manager {
                             let cam_aabb = self.camera.world_aabb();
-                            renderer.render_tiles(gpu, tm.loaded_tiles_in_aabb(cam_aabb), &self.layer_visibility, clear, self.camera.zoom)
+                            #[cfg(target_arch = "wasm32")]
+                            let base_iter: Box<dyn Iterator<Item = (&tiles::LoadedTile, tiles::BaseTileCoord)>> =
+                                if let Some(btm) = &self.base_tile_manager {
+                                    Box::new(btm.loaded_tiles_with_coords_in_aabb(cam_aabb))
+                                } else {
+                                    Box::new(std::iter::empty())
+                                };
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let base_iter = std::iter::empty::<(&tiles::LoadedTile, tiles::BaseTileCoord)>();
+                            // The label rebuild already filters the WGSL label
+                            // set to large place names while zoomed out, so the
+                            // labels pass can run normally; HTML badges (DOM
+                            // markers) are unaffected either way.
+                            let effective_layers = self.layer_visibility.clone();
+                            renderer.render_tiles(gpu, tm.loaded_tiles_in_aabb(cam_aabb), base_iter, &effective_layers, clear, self.camera.zoom)
                         } else {
                             renderer.render(gpu, &self.layer_visibility, clear)
                         }
@@ -1108,8 +1191,20 @@ impl App {
                 let (clat, clon) = self.get_start_center();
                 self.tile_manager = Some(tiles::TileManager::new(clat, clon));
             }
+            #[cfg(target_arch = "wasm32")]
+            if self.base_tile_manager.is_none() {
+                let underlay_zoom = api::INIT_CONFIG.with(|c| {
+                    c.borrow().as_ref().and_then(|cfg| cfg.low_res_underlay)
+                });
+                if let Some(z) = underlay_zoom {
+                    let (clat, clon) = self.get_start_center();
+                    self.base_tile_manager = Some(tiles::BaseTileManager::new(clat, clon, z));
+                }
+            }
             if let (Some(gpu), Some(tm)) = (&self.gpu, &mut self.tile_manager) {
                 tm.poll_completed(gpu, elapsed);
+                tm.update_zoom_state(gpu, self.camera.zoom, elapsed);
+                tm.evict_dead_tiles(elapsed);
                 let frame = tm.frame_counter;
                 tm.frame_counter += 1;
                 if frame % 10 == 0 || frame < 3 {
@@ -1129,13 +1224,33 @@ impl App {
                 let camera_settled = self.frames_since_camera_moved > 10;
                 let should_rebuild = self.labels_dirty && camera_settled;
                 if should_rebuild {
-                    let label_refs: Vec<_> = tm.all_labels().into_iter().cloned().collect();
+                    let mut label_refs: Vec<crate::mapdata::Label> =
+                        tm.all_labels().into_iter().cloned().collect();
+                    #[cfg(target_arch = "wasm32")]
+                    if tm.low_zoom_active {
+                        if let Some(btm) = &self.base_tile_manager {
+                            label_refs.extend(btm.large_labels().into_iter().cloned());
+                        }
+                    }
                     let viewport_min = gpu.size.width.min(gpu.size.height) as f32;
                     if let Some(renderer) = &mut self.renderer {
                         renderer.text.upload_labels_themed(&gpu.device, &gpu.queue, &label_refs, self.camera.zoom, self.road_tint, self.land_tint, viewport_min);
                     }
                     self.last_label_zoom = self.camera.zoom;
                     self.labels_dirty = false;
+                }
+            }
+
+            // Base-tile underlay: poll completion and fetch on the same throttle.
+            #[cfg(target_arch = "wasm32")]
+            if let (Some(gpu), Some(btm)) = (&self.gpu, &mut self.base_tile_manager) {
+                btm.poll_completed(gpu, elapsed);
+                let frame = btm.frame_counter;
+                btm.frame_counter += 1;
+                if frame % 10 == 0 || frame < 3 {
+                    let visible = btm.visible_tiles(&self.camera);
+                    btm.request_visible_tiles(&visible);
+                    btm.update_visibility(&visible);
                 }
             }
         }
@@ -1214,6 +1329,8 @@ impl App {
             let has_markers = !self.markers.is_empty();
             let has_loading_tiles = self.use_tiles && self.tile_manager.as_ref()
                 .map_or(false, |tm| tm.tiles.values().any(|s| matches!(s, crate::tiles::TileState::Loading)));
+            let has_dying_tiles = self.use_tiles && self.tile_manager.as_ref()
+                .map_or(false, |tm| tm.has_dying_tiles());
             let clouds_animating = self.layer_visibility.clouds && self.cloud_opacity > 0.01 && self.cloud_speed > 0.01;
             let noise_animating = self.layer_visibility.noise;
             let needs_render = camera_moved
@@ -1222,6 +1339,7 @@ impl App {
                 || self.labels_dirty
                 || has_markers
                 || has_loading_tiles
+                || has_dying_tiles
                 || !self.ready_emitted
                 || !self.first_render_done
                 || self.frames_since_gpu_init < 300
@@ -1235,10 +1353,16 @@ impl App {
             let label_target = if self.frames_since_camera_moved <= 10 { 0.4 } else { 1.0 };
             self.label_fade += (label_target - self.label_fade) * 0.3;
 
+            // Small-label fade — see the matching block above for derivation.
+            let small_label_target = if self.tile_manager.as_ref()
+                .map_or(false, |tm| tm.low_zoom_active) { 0.0 } else { 1.0 };
+            self.small_label_fade += (small_label_target - self.small_label_fade) * 0.05;
+
             let mut uniform = self.camera.uniform(elapsed);
             uniform.cloud_opacity = self.cloud_opacity;
             uniform.cloud_speed = self.cloud_speed;
             uniform.label_alpha = self.label_fade;
+            uniform.small_label_alpha = self.small_label_fade;
             uniform.water_tint = self.water_tint;
             uniform.park_tint = self.park_tint;
             uniform.building_tint = self.building_tint;
@@ -1256,7 +1380,17 @@ impl App {
             let render_result = if self.use_tiles {
                 if let Some(tm) = &self.tile_manager {
                     let cam_aabb = self.camera.world_aabb();
-                    renderer.render_tiles(gpu, tm.loaded_tiles_in_aabb(cam_aabb), &self.layer_visibility, clear, self.camera.zoom)
+                    #[cfg(target_arch = "wasm32")]
+                    let base_iter: Box<dyn Iterator<Item = (&tiles::LoadedTile, tiles::BaseTileCoord)>> =
+                        if let Some(btm) = &self.base_tile_manager {
+                            Box::new(btm.loaded_tiles_with_coords_in_aabb(cam_aabb))
+                        } else {
+                            Box::new(std::iter::empty())
+                        };
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let base_iter = std::iter::empty::<(&tiles::LoadedTile, tiles::BaseTileCoord)>();
+                    let effective_layers = self.layer_visibility.clone();
+                    renderer.render_tiles(gpu, tm.loaded_tiles_in_aabb(cam_aabb), base_iter, &effective_layers, clear, self.camera.zoom)
                 } else {
                     renderer.render(gpu, &self.layer_visibility, clear)
                 }

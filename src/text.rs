@@ -10,6 +10,12 @@ pub struct TextVertex {
     pub pixel_offset: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
+    /// 0.0 for "large" labels (State/City/District/Marker), 1.0 for "small"
+    /// labels (Street/Building/POI/Park). The shader uses this to multiply
+    /// only small labels by `camera.small_label_alpha`, so street names fade
+    /// out alongside the z14 tiles when zoom drops below threshold while
+    /// state/city names stay put.
+    pub kind_flag: f32,
 }
 
 /// Metrics for a single glyph in the atlas.
@@ -173,6 +179,7 @@ impl TextSystem {
                 wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },   // pixel_offset
                 wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },  // uv
                 wgpu::VertexAttribute { offset: 24, shader_location: 3, format: wgpu::VertexFormat::Float32x4 },  // color
+                wgpu::VertexAttribute { offset: 40, shader_location: 4, format: wgpu::VertexFormat::Float32 },    // kind_flag
             ],
         };
 
@@ -406,6 +413,17 @@ impl TextSystem {
                 _ => (text_color, halo_color),
             };
 
+            // Per-vertex kind flag — 1.0 for "small" labels that fade alongside
+            // z14 tiles when zoom drops below threshold, 0.0 for large place
+            // names (State / City / District / user Marker) which stay visible.
+            let kind_flag: f32 = match label.kind {
+                crate::mapdata::LabelKind::State
+                | crate::mapdata::LabelKind::City
+                | crate::mapdata::LabelKind::District
+                | crate::mapdata::LabelKind::Marker => 0.0,
+                _ => 1.0,
+            };
+
             // Measure total width for centering and collision bounds
             let total_width: f32 = label.text.chars()
                 .filter_map(|c| self.get_glyph(c))
@@ -478,7 +496,7 @@ impl TextSystem {
                                     label.position,
                                     cx + glyph.bearing[0] * scale,
                                     cy + glyph.bearing[1] * scale,
-                                    glyph, scale, label_halo_color, &rotate,
+                                    glyph, scale, label_halo_color, kind_flag, &rotate,
                                     &mut vertices, &mut indices,
                                 );
                                 cx += glyph.advance * scale * spacing;
@@ -494,7 +512,7 @@ impl TextSystem {
                                 label.position,
                                 cx + glyph.bearing[0] * scale,
                                 cy + glyph.bearing[1] * scale,
-                                glyph, scale, label_text_color, &rotate,
+                                glyph, scale, label_text_color, kind_flag, &rotate,
                                 &mut vertices, &mut indices,
                             );
                             cx += glyph.advance * scale * spacing;
@@ -528,6 +546,7 @@ impl TextSystem {
                             glyph,
                             scale,
                             label_halo_color,
+                            kind_flag,
                             &rotate,
                             &mut vertices,
                             &mut indices,
@@ -550,6 +569,7 @@ impl TextSystem {
                         glyph,
                         scale,
                         label_text_color,
+                        kind_flag,
                         &rotate,
                         &mut vertices,
                         &mut indices,
@@ -584,6 +604,7 @@ impl TextSystem {
         glyph: &GlyphInfo,
         scale: f32,
         color: [f32; 4],
+        kind_flag: f32,
         rotate: &dyn Fn(f32, f32) -> (f32, f32),
         vertices: &mut Vec<TextVertex>,
         indices: &mut Vec<u32>,
@@ -603,10 +624,10 @@ impl TextSystem {
         let (r2x, r2y) = rotate(px, py + h);
         let (r3x, r3y) = rotate(px + w, py + h);
 
-        vertices.push(TextVertex { world_pos, pixel_offset: [r0x, r0y], uv: [glyph.uv_min[0], glyph.uv_min[1]], color });
-        vertices.push(TextVertex { world_pos, pixel_offset: [r1x, r1y], uv: [glyph.uv_max[0], glyph.uv_min[1]], color });
-        vertices.push(TextVertex { world_pos, pixel_offset: [r2x, r2y], uv: [glyph.uv_min[0], glyph.uv_max[1]], color });
-        vertices.push(TextVertex { world_pos, pixel_offset: [r3x, r3y], uv: [glyph.uv_max[0], glyph.uv_max[1]], color });
+        vertices.push(TextVertex { world_pos, pixel_offset: [r0x, r0y], uv: [glyph.uv_min[0], glyph.uv_min[1]], color, kind_flag });
+        vertices.push(TextVertex { world_pos, pixel_offset: [r1x, r1y], uv: [glyph.uv_max[0], glyph.uv_min[1]], color, kind_flag });
+        vertices.push(TextVertex { world_pos, pixel_offset: [r2x, r2y], uv: [glyph.uv_min[0], glyph.uv_max[1]], color, kind_flag });
+        vertices.push(TextVertex { world_pos, pixel_offset: [r3x, r3y], uv: [glyph.uv_max[0], glyph.uv_max[1]], color, kind_flag });
 
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
     }
@@ -724,8 +745,9 @@ impl TextSystem {
 
                 let px = -advance_px * 0.5 + glyph.bearing[0] * scale + ox;
                 let py = -self.font_size * scale * 0.5 + glyph.bearing[1] * scale + oy;
+                // Curved labels are always streets — kind_flag = 1.0 (small).
                 self.emit_glyph_quad_rotated(
-                    [wx, wy], px, py, glyph, scale, color, &rotate,
+                    [wx, wy], px, py, glyph, scale, color, 1.0, &rotate,
                     verts, idxs,
                 );
                 cursor_px += advance_px;
