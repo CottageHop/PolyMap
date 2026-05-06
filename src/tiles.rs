@@ -104,6 +104,22 @@ const MAX_TILE_RETRIES: u32 = 3;
 /// Base backoff seconds for failed tiles (doubles each retry).
 const FAIL_BACKOFF_BASE_SECS: f64 = 2.0;
 
+/// Camera zoom below which z14 detail isn't worth keeping around: the base
+/// underlay carries the visual load and z14 GPU memory + fetch budget is
+/// better spent on tiles the user can actually see. Tuned empirically — the
+/// default initial zoom in `web/index.html` is 0.8.
+pub const LOW_ZOOM_THRESHOLD: f32 = -1.75;
+
+/// Seconds the fade-out animation runs before the tile is eligible for
+/// eviction. Matches the shader's `smoothstep(0.0, 0.6, dying_age)` upper
+/// bound in `tile_fade`.
+pub const FADE_OUT_DURATION: f32 = 0.6;
+
+/// Extra grace period after the fade completes before actually freeing GPU
+/// buffers — gives the user a brief window to zoom back in and cancel the
+/// fade without paying the rebuild cost.
+pub const EVICT_DELAY_AFTER_FADE: f32 = 0.1;
+
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
 pub struct TileCoord {
     pub col: i32,
@@ -137,10 +153,10 @@ pub enum TileState {
 
 pub struct LoadedTile {
     pub vertex_buffer: wgpu::Buffer,
-    /// Parallel vertex buffer holding `birth_time: f32` per vertex — the tile's
-    /// upload time (seconds since app start). Shader compares to camera.time
-    /// to fade the tile in smoothly on load. Matches the vertex count of
-    /// `vertex_buffer`.
+    /// Parallel vertex buffer holding `birth_time: f32` per vertex.
+    /// Encoding: `0` = legacy single-shot (always visible); `> 0` = born at
+    /// that time (fade-in animation); `< 0` = dying, with `-birth_time` being
+    /// the death time (fade-out animation). Same value across all vertices.
     pub birth_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
@@ -154,6 +170,13 @@ pub struct LoadedTile {
     pub last_visible_frame: u64,
     /// z14 MVT tile coordinates — used for dedup in rendering
     pub z14_tile: (u32, u32),
+    /// Vertex count for the main buffer — needed when rewriting birth_buffer
+    /// for fade-out.
+    pub vertex_count: u32,
+    pub shadow_vertex_count: u32,
+    /// `Some(t)` if the tile is fading out; `t` is the death time. Eviction
+    /// happens after `t + FADE_OUT_DURATION + EVICT_DELAY_AFTER_FADE`.
+    pub death_time: Option<f32>,
 }
 
 impl LoadedTile {
@@ -166,16 +189,17 @@ impl LoadedTile {
         // Parallel birth-time buffer: one f32 per vertex, all the same value.
         // Keeps the main vertex layout binary-compatible with polymap-worker
         // while letting the shader fade the tile in on load.
+        // COPY_DST so start_death / cancel_death can rewrite it in-place.
         let birth_data: Vec<f32> = vec![birth_time; data.vertices.len().max(1)];
         let birth_buffer = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile Birth VB",
-            bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX);
+            bytemuck::cast_slice(&birth_data), wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
 
         let (shadow_vb, shadow_bb, shadow_ib, num_shadow) = if !data.shadow_vertices.is_empty() {
             let svb = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile SVB",
                 bytemuck::cast_slice(&data.shadow_vertices), wgpu::BufferUsages::VERTEX);
             let shadow_birth: Vec<f32> = vec![birth_time; data.shadow_vertices.len()];
             let sbb = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile Shadow Birth VB",
-                bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX);
+                bytemuck::cast_slice(&shadow_birth), wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST);
             let sib = crate::gpu::safe_buffer(&gpu.device, &gpu.queue, "Tile SIB",
                 bytemuck::cast_slice(&data.shadow_indices), wgpu::BufferUsages::INDEX);
             (Some(svb), Some(sbb), Some(sib), data.shadow_indices.len() as u32)
@@ -197,6 +221,53 @@ impl LoadedTile {
             noise_sources: data.noise_sources.clone(),
             last_visible_frame: 0,
             z14_tile,
+            vertex_count: data.vertices.len() as u32,
+            shadow_vertex_count: data.shadow_vertices.len() as u32,
+            death_time: None,
+        }
+    }
+
+    /// Begin the fade-out animation by overwriting the birth buffer with a
+    /// negative death sentinel: `birth_time = -now_secs` for every vertex.
+    /// The shader interprets negative birth_time as "dying" and ramps alpha
+    /// from 1 → 0 over `FADE_OUT_DURATION` seconds.
+    pub fn start_death(&mut self, gpu: &GpuState, now_secs: f32) {
+        if self.death_time.is_some() { return; }
+        self.death_time = Some(now_secs);
+        // Encode death as negative birth_time. now_secs is always positive in
+        // practice, so -now_secs is < 0 and disambiguated from 0 (legacy).
+        let neg = -now_secs;
+        if self.vertex_count > 0 {
+            let buf: Vec<f32> = vec![neg; self.vertex_count as usize];
+            gpu.queue.write_buffer(&self.birth_buffer, 0, bytemuck::cast_slice(&buf));
+        }
+        if self.shadow_vertex_count > 0 {
+            if let Some(b) = &self.shadow_birth_buffer {
+                let sbuf: Vec<f32> = vec![neg; self.shadow_vertex_count as usize];
+                gpu.queue.write_buffer(b, 0, bytemuck::cast_slice(&sbuf));
+            }
+        }
+    }
+
+    /// Abort an in-progress fade-out and snap the tile back to fully visible.
+    /// Used when the camera zooms back in before the fade completes — without
+    /// this, the tile would finish dying despite being visible again.
+    /// The snap-back skips the fade-in animation by writing a birth_time well
+    /// in the past (now − 1.0 s); the shader's `smoothstep(0, 0.4, age)` is
+    /// already saturated at age = 1.0.
+    pub fn cancel_death(&mut self, gpu: &GpuState, now_secs: f32) {
+        if self.death_time.is_none() { return; }
+        self.death_time = None;
+        let birth = (now_secs - 1.0).max(0.001);
+        if self.vertex_count > 0 {
+            let buf: Vec<f32> = vec![birth; self.vertex_count as usize];
+            gpu.queue.write_buffer(&self.birth_buffer, 0, bytemuck::cast_slice(&buf));
+        }
+        if self.shadow_vertex_count > 0 {
+            if let Some(b) = &self.shadow_birth_buffer {
+                let sbuf: Vec<f32> = vec![birth; self.shadow_vertex_count as usize];
+                gpu.queue.write_buffer(b, 0, bytemuck::cast_slice(&sbuf));
+            }
         }
     }
 }
@@ -213,6 +284,9 @@ pub struct TileManager {
     current_detail: DetailLevel,
     /// Tracks how many times each tile has failed (for backoff).
     fail_counts: HashMap<TileCoord, u32>,
+    /// True while the camera zoom is below `LOW_ZOOM_THRESHOLD`. While true,
+    /// new z14 fetches are paused and any Loaded tiles fade out and evict.
+    pub low_zoom_active: bool,
 
     #[cfg(not(target_arch = "wasm32"))]
     receiver: std::sync::mpsc::Receiver<(TileCoord, Result<(MapData, bool), String>)>,
@@ -239,6 +313,7 @@ impl TileManager {
             in_flight: 0,
             current_detail: DetailLevel::High,
             fail_counts: HashMap::new(),
+            low_zoom_active: false,
 
             #[cfg(not(target_arch = "wasm32"))]
             receiver,
@@ -345,6 +420,12 @@ impl TileManager {
 
     /// Request tiles from the sorted visible list. Processes as many as allowed.
     pub fn request_visible_tiles(&mut self, visible: &[TileCoord]) {
+        // While zoomed out below threshold, the base-layer underlay carries
+        // the visuals and z14 detail isn't worth fetching. Returning early
+        // also stops new tiles from arriving mid-fade-out and confusing the
+        // user.
+        if self.low_zoom_active { return; }
+
         let now = web_time::Instant::now();
 
         // Respect rate limit cooldown
@@ -647,7 +728,10 @@ impl TileManager {
         })
     }
 
-    /// Collect all labels from loaded tiles.
+    /// Collect all labels from loaded tiles. Dying tiles' labels are kept in
+    /// the set so small (Street/Building/POI/Park) labels can fade smoothly
+    /// via the shader's `small_label_alpha` while the tile geometry fades.
+    /// They drop out naturally when the tile evicts.
     pub fn all_labels(&self) -> Vec<&Label> {
         self.tiles.values().filter_map(|state| {
             match state {
@@ -655,6 +739,71 @@ impl TileManager {
                 _ => None,
             }
         }).flatten().collect()
+    }
+
+    /// React to zoom changes: when zoom drops below LOW_ZOOM_THRESHOLD, start
+    /// fading out all Loaded z14 tiles. When zoom rises above, cancel any
+    /// in-progress fades so the tiles snap back to fully visible without a
+    /// rebuild.
+    pub fn update_zoom_state(&mut self, gpu: &GpuState, zoom: f32, now_secs: f32) {
+        let want_low = zoom < LOW_ZOOM_THRESHOLD;
+        if want_low == self.low_zoom_active { return; }
+        self.low_zoom_active = want_low;
+        self.tiles_changed = true;
+
+        if want_low {
+            // Mark every currently-loaded tile dying; eviction follows the fade.
+            for state in self.tiles.values_mut() {
+                if let TileState::Loaded(tile) = state {
+                    tile.start_death(gpu, now_secs);
+                }
+            }
+        } else {
+            // Cancel in-progress fades. Stale tiles aren't relevant here — the
+            // detail-level path handles those.
+            for state in self.tiles.values_mut() {
+                if let TileState::Loaded(tile) = state {
+                    if tile.death_time.is_some() {
+                        tile.cancel_death(gpu, now_secs);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop any tile whose fade-out animation has finished plus a small grace
+    /// period. Frees the GPU buffers so the budget is available for tiles the
+    /// user is actually looking at.
+    pub fn evict_dead_tiles(&mut self, now_secs: f32) {
+        let cutoff = FADE_OUT_DURATION + EVICT_DELAY_AFTER_FADE;
+        let to_drop: Vec<_> = self.tiles.iter()
+            .filter_map(|(coord, state)| {
+                if let TileState::Loaded(t) = state {
+                    if let Some(dt) = t.death_time {
+                        if now_secs - dt > cutoff {
+                            return Some(*coord);
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        if !to_drop.is_empty() {
+            for coord in to_drop {
+                self.tiles.remove(&coord);
+                self.fail_counts.remove(&coord);
+            }
+            self.tiles_changed = true;
+        }
+    }
+
+    /// True if any loaded tile is mid-fade-out — used by the render loop's
+    /// `needs_render` check to keep drawing while the animation runs.
+    pub fn has_dying_tiles(&self) -> bool {
+        self.tiles.values().any(|state| match state {
+            TileState::Loaded(t) => t.death_time.is_some(),
+            _ => false,
+        })
     }
 }
 
@@ -821,4 +970,348 @@ async fn fetch_tile_wasm(
         let data = mapdata::parse_osm_json_centered(&body, south, west, north, east, center_lat, center_lon)?;
         Ok((data, true))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Low-resolution base-layer tiles (themed underlay)
+//
+// Fetches lower-zoom MVT tiles (e.g. z11) from the same PMTiles archive,
+// decodes them at DetailLevel::Low (water + landuse + road fills only), and
+// uploads each as a LoadedTile. The renderer draws these in a pass before the
+// z14 opaque pass; depth test occludes them where high-res has rendered.
+// Z values are shifted down by BASE_Z_OFFSET so the underlay sits below the
+// z14 plane and never z-fights with high-res tiles.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of base tiles GPU-resident at once. A single z11 tile covers
+/// ~8x8 of PolyMap's 0.01° tiles, so 8 base tiles cover a much larger area
+/// than the typical viewport with pan padding.
+#[cfg(target_arch = "wasm32")]
+const MAX_BASE_TILES: usize = 8;
+
+/// Concurrent base-tile fetches. Kept low so the base layer doesn't compete
+/// with the z14 fetch budget — the underlay is best-effort, not critical.
+#[cfg(target_arch = "wasm32")]
+const MAX_BASE_IN_FLIGHT: usize = 2;
+
+/// Z offset baked into every base-tile vertex. Pushes the entire base layer
+/// below the z14 plane (Z_LANDUSE = -0.005 in mapdata.rs), so the depth test
+/// reliably occludes base geometry where z14 has rendered. Far enough below
+/// the deepest z14 feature (-0.005) to avoid z-fighting under tilt, but not
+/// so far that the base layer pokes through above-ground features at any
+/// viewing angle.
+#[cfg(target_arch = "wasm32")]
+const BASE_Z_OFFSET: f32 = -0.05;
+
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
+pub struct BaseTileCoord {
+    pub z: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+pub struct BaseLoadedTile {
+    pub inner: LoadedTile,
+    pub coord: BaseTileCoord,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Decoded MapData cache for base tiles. Separate from MAPDATA_CACHE so
+    /// the well-tuned z14 cache isn't perturbed by the (much smaller) base
+    /// tile working set.
+    static BASE_MAPDATA_CACHE: std::cell::RefCell<LruCache<(u8, u32, u32), Rc<MapData>>> =
+        std::cell::RefCell::new(LruCache::new(16));
+}
+
+/// Apply a uniform Z shift to every vertex (and shadow vertex) in a MapData.
+/// Used to push base-layer geometry below the z14 plane.
+fn shift_mapdata_z(data: &mut MapData, dz: f32) {
+    for v in &mut data.vertices {
+        v.position[2] += dz;
+    }
+    for v in &mut data.shadow_vertices {
+        v.position[2] += dz;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct BaseTileManager {
+    tiles: HashMap<BaseTileCoord, TileState>,
+    pub center_lat: f64,
+    pub center_lon: f64,
+    pub frame_counter: u64,
+    pub tiles_changed: bool,
+    in_flight: usize,
+    last_request_time: web_time::Instant,
+    rate_limited_until: Option<web_time::Instant>,
+    fail_counts: HashMap<BaseTileCoord, u32>,
+    /// Zoom level for base tiles (from PolyMapConfig::low_res_underlay).
+    pub zoom: u8,
+    completed: std::rc::Rc<std::cell::RefCell<Vec<(BaseTileCoord, Result<MapData, String>)>>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BaseTileManager {
+    pub fn new(center_lat: f64, center_lon: f64, zoom: u8) -> Self {
+        Self {
+            tiles: HashMap::new(),
+            center_lat,
+            center_lon,
+            frame_counter: 0,
+            tiles_changed: false,
+            in_flight: 0,
+            last_request_time: web_time::Instant::now(),
+            rate_limited_until: None,
+            fail_counts: HashMap::new(),
+            zoom,
+            completed: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Tile coords visible from the current camera, in z11-tile space.
+    /// Pads by 1 tile on each side for smooth pan.
+    pub fn visible_tiles(&self, camera: &crate::camera::Camera) -> Vec<BaseTileCoord> {
+        let hw = camera.viewport.x * 0.5;
+        let hh = camera.viewport.y * 0.5;
+        let points = [
+            camera.unproject_to_world(0.0, 0.0),
+            camera.unproject_to_world(camera.viewport.x, 0.0),
+            camera.unproject_to_world(0.0, camera.viewport.y),
+            camera.unproject_to_world(camera.viewport.x, camera.viewport.y),
+            camera.unproject_to_world(hw, hh),
+            camera.position,
+        ];
+
+        let mut min_lat = f64::MAX;
+        let mut max_lat = f64::MIN;
+        let mut min_lon = f64::MAX;
+        let mut max_lon = f64::MIN;
+        for pt in &points {
+            let (lat, lon) = mapdata::unproject_pub(pt.x, pt.y, self.center_lat, self.center_lon);
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+        }
+
+        let z = self.zoom;
+        let (x_min, y_max) = latlon_to_zxy(min_lat, min_lon, z);
+        let (x_max, y_min) = latlon_to_zxy(max_lat, max_lon, z);
+        // Pad by 1 z11 tile on each side. (z11 tiles are large; 1 is enough.)
+        let x0 = x_min.saturating_sub(1);
+        let x1 = x_max.saturating_add(1);
+        let y0 = y_min.saturating_sub(1);
+        let y1 = y_max.saturating_add(1);
+
+        let mut out = Vec::new();
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                out.push(BaseTileCoord { z, x, y });
+            }
+        }
+        out
+    }
+
+    /// Dispatch fetches for visible tiles (respecting in-flight + cooldown).
+    pub fn request_visible_tiles(&mut self, visible: &[BaseTileCoord]) {
+        let now = web_time::Instant::now();
+        if let Some(until) = self.rate_limited_until {
+            if now < until { return; }
+            self.rate_limited_until = None;
+        }
+
+        for coord in visible {
+            if self.in_flight >= MAX_BASE_IN_FLIGHT { break; }
+            match self.tiles.get(coord) {
+                Some(TileState::Loaded(_)) | Some(TileState::Loading) => continue,
+                Some(TileState::Stale(_)) => {} // shouldn't happen for base; treat as loaded
+                Some(TileState::Failed(retry_after)) => {
+                    let retries = self.fail_counts.get(coord).copied().unwrap_or(0);
+                    if retries >= MAX_TILE_RETRIES { continue; }
+                    if now < *retry_after { continue; }
+                    self.tiles.remove(coord);
+                }
+                None => {}
+            }
+            let elapsed = now.duration_since(self.last_request_time).as_secs_f64();
+            if elapsed < FETCH_INTERVAL && self.in_flight > 0 { break; }
+
+            self.dispatch_tile(*coord);
+            self.last_request_time = now;
+        }
+    }
+
+    fn dispatch_tile(&mut self, coord: BaseTileCoord) {
+        self.tiles.insert(coord, TileState::Loading);
+        self.in_flight += 1;
+
+        let center_lat = self.center_lat;
+        let center_lon = self.center_lon;
+        let completed = self.completed.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = fetch_base_tile_wasm(coord.z, coord.x, coord.y, center_lat, center_lon).await;
+            completed.borrow_mut().push((coord, result));
+        });
+    }
+
+    fn record_failure(&mut self, coord: BaseTileCoord) {
+        let retries = self.fail_counts.entry(coord).or_insert(0);
+        *retries += 1;
+        let exp = ((*retries as i64 - 1).clamp(0, 20)) as i32;
+        let backoff = FAIL_BACKOFF_BASE_SECS * 2.0_f64.powi(exp);
+        self.tiles.insert(coord, TileState::Failed(
+            web_time::Instant::now() + std::time::Duration::from_secs_f64(backoff),
+        ));
+    }
+
+    pub fn poll_completed(&mut self, gpu: &GpuState, now_secs: f32) {
+        self.tiles_changed = false;
+        let results: Vec<_> = self.completed.borrow_mut().drain(..).collect();
+        for (coord, result) in results {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.tiles_changed = true;
+            match result {
+                Ok(mut data) => {
+                    if !data.vertices.is_empty() {
+                        shift_mapdata_z(&mut data, BASE_Z_OFFSET);
+                        // z14_tile field unused for base tiles — pass (0, 0).
+                        let inner = LoadedTile::from_map_data(gpu, &data, (0, 0), now_secs);
+                        self.fail_counts.remove(&coord);
+                        self.tiles.insert(coord, TileState::Loaded(inner));
+                    } else {
+                        self.record_failure(coord);
+                    }
+                }
+                Err(e) => {
+                    if e == "RATE_LIMITED" {
+                        self.rate_limited_until = Some(web_time::Instant::now()
+                            + std::time::Duration::from_secs_f64(RATE_LIMIT_COOLDOWN_SECS));
+                        self.tiles.remove(&coord);
+                    } else {
+                        log::warn!("Base tile {:?} failed: {}", coord, e);
+                        self.record_failure(coord);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark visible tiles fresh and evict the oldest non-visible tile if over budget.
+    pub fn update_visibility(&mut self, visible: &[BaseTileCoord]) {
+        for coord in visible {
+            if let Some(TileState::Loaded(tile)) = self.tiles.get_mut(coord) {
+                tile.last_visible_frame = self.frame_counter;
+            }
+        }
+        let current_frame = self.frame_counter;
+        let loaded_count = self.tiles.values()
+            .filter(|s| matches!(s, TileState::Loaded(_)))
+            .count();
+        let mut evicted = 0;
+        while loaded_count - evicted > MAX_BASE_TILES {
+            let oldest = self.tiles.iter()
+                .filter_map(|(coord, state)| match state {
+                    TileState::Loaded(tile) => {
+                        if tile.last_visible_frame >= current_frame.saturating_sub(1) {
+                            None
+                        } else {
+                            Some((*coord, tile.last_visible_frame))
+                        }
+                    }
+                    TileState::Failed(_) => Some((*coord, 0)),
+                    _ => None,
+                })
+                .min_by_key(|(_, frame)| *frame);
+            if let Some((coord, _)) = oldest {
+                self.tiles.remove(&coord);
+                self.fail_counts.remove(&coord);
+                evicted += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Labels from base tiles, restricted to large place kinds (State, City,
+    /// District). Used while zoomed out — the z14 tiles' Street/Building/POI
+    /// labels are fading away with their tiles, but place names should remain.
+    pub fn large_labels(&self) -> Vec<&Label> {
+        use crate::mapdata::LabelKind;
+        self.tiles.values().filter_map(|state| {
+            if let TileState::Loaded(tile) = state {
+                Some(tile.labels.iter().filter(|l| matches!(
+                    l.kind,
+                    LabelKind::State | LabelKind::City | LabelKind::District
+                )))
+            } else {
+                None
+            }
+        }).flatten().collect()
+    }
+
+    /// Loaded base tiles + their coords (renderer dedups on the coord).
+    /// Filters by camera AABB intersection so off-screen tiles are skipped.
+    pub fn loaded_tiles_with_coords_in_aabb<'a>(
+        &'a self,
+        cam_aabb: (f32, f32, f32, f32),
+    ) -> impl Iterator<Item = (&'a LoadedTile, BaseTileCoord)> + 'a {
+        let (cmin_x, cmin_y, cmax_x, cmax_y) = cam_aabb;
+        let center_lat = self.center_lat;
+        let center_lon = self.center_lon;
+        self.tiles.iter().filter_map(move |(coord, state)| {
+            let tile = match state {
+                TileState::Loaded(t) => t,
+                _ => return None,
+            };
+            // z11 tile bbox in lat/lon (Web Mercator).
+            let n = (1u64 << coord.z) as f64;
+            let west = coord.x as f64 / n * 360.0 - 180.0;
+            let east = (coord.x as f64 + 1.0) / n * 360.0 - 180.0;
+            // Tile y is inverted: y=0 is north pole.
+            let north_rad = (std::f64::consts::PI * (1.0 - 2.0 * coord.y as f64 / n)).sinh().atan();
+            let south_rad = (std::f64::consts::PI * (1.0 - 2.0 * (coord.y as f64 + 1.0) / n)).sinh().atan();
+            let north = north_rad.to_degrees();
+            let south = south_rad.to_degrees();
+            let sw = crate::mapdata::project_pub(south, west, center_lat, center_lon);
+            let ne = crate::mapdata::project_pub(north, east, center_lat, center_lon);
+            let tile_min_x = sw[0].min(ne[0]);
+            let tile_max_x = sw[0].max(ne[0]);
+            let tile_min_y = sw[1].min(ne[1]);
+            let tile_max_y = sw[1].max(ne[1]);
+            if tile_max_x < cmin_x || tile_min_x > cmax_x { return None; }
+            if tile_max_y < cmin_y || tile_min_y > cmax_y { return None; }
+            Some((tile, *coord))
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_base_tile_wasm(
+    z: u8, x: u32, y: u32,
+    center_lat: f64, center_lon: f64,
+) -> Result<MapData, String> {
+    let pmtiles_url = crate::api::INIT_CONFIG.with(|c| {
+        c.borrow().as_ref().and_then(|cfg| cfg.pmtiles_url.clone())
+    }).ok_or("PMTiles URL not configured")?;
+
+    // Cache lookup
+    let cached = BASE_MAPDATA_CACHE.with(|c| c.borrow().get(&(z, x, y)).cloned());
+    if let Some(cached) = cached {
+        return Ok((*cached).clone());
+    }
+
+    let mvt_bytes = crate::pmtiles::get_tile(&pmtiles_url, z, x, y)
+        .await
+        .ok_or("Base PMTiles fetch failed")?;
+    let mvt_tile = crate::mvt::decode_tile(&mvt_bytes);
+    let data = crate::mvt_convert::mvt_to_mapdata(
+        &mvt_tile, z, x, y, center_lat, center_lon,
+        crate::mvt_convert::DetailLevel::Low,
+    );
+    let rc_data = Rc::new(data.clone());
+    BASE_MAPDATA_CACHE.with(|c| {
+        c.borrow_mut().insert((z, x, y), Rc::clone(&rc_data));
+    });
+    Ok(data)
 }

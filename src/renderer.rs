@@ -107,7 +107,11 @@ impl Renderer {
                         entry_point: Some("fs_main"),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: gpu.config.format,
-                            blend: Some(wgpu::BlendState::REPLACE),
+                            // Alpha blending so tile fade-in / fade-out blends
+                            // with the destination (base underlay or clear color).
+                            // For α=1.0 (the default for all map colors) this is
+                            // equivalent to REPLACE.
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
                         compilation_options: Default::default(),
@@ -435,6 +439,7 @@ impl Renderer {
         &'a self,
         gpu: &'a GpuState,
         tiles: impl Iterator<Item = &'a crate::tiles::LoadedTile>,
+        base_tiles: impl Iterator<Item = (&'a crate::tiles::LoadedTile, crate::tiles::BaseTileCoord)>,
         layers: &LayerVisibility,
         clear_color: [f64; 3],
         camera_zoom: f32,
@@ -479,6 +484,35 @@ impl Renderer {
 
             // Pass 0: Background texture
             self.textures.render_background(&mut render_pass, &gpu.camera_bind_group);
+
+            // Collect base tiles, dedup by BaseTileCoord. Pre-collected so we can
+            // bind the pipeline once and iterate. Vertices are pre-shifted in Z
+            // by BASE_Z_OFFSET, so depth test occludes them where high-res renders.
+            let base_tile_list: Vec<_> = {
+                let mut seen = std::collections::HashSet::with_capacity(16);
+                let mut v = Vec::with_capacity(16);
+                for (tile, coord) in base_tiles {
+                    if tile.num_indices > 0 && seen.insert(coord) {
+                        v.push(tile);
+                    }
+                }
+                v
+            };
+
+            // Pass 0.5: Low-res themed underlay. Same pipeline + shader + bind groups
+            // as Pass 1 — only the geometry differs. Theme tints are uniforms, so
+            // both layers retint together.
+            if !base_tile_list.is_empty() {
+                render_pass.set_pipeline(&self.map_pipeline);
+                render_pass.set_bind_group(0, &gpu.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, self.textures.material_bind_group().unwrap(), &[]);
+                for tile in &base_tile_list {
+                    render_pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
+                    render_pass.set_vertex_buffer(1, tile.birth_buffer.slice(..));
+                    render_pass.set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..tile.num_indices, 0, 0..1);
+                }
+            }
 
             // Collect tiles, dedup by z14
             let tile_list: Vec<_> = {

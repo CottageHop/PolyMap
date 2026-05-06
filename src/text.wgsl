@@ -11,8 +11,8 @@ struct CameraUniform {
     cloud_opacity: f32,
     cloud_speed: f32,
     label_alpha: f32,
+    small_label_alpha: f32,
     _pad2b: f32,
-    _pad2c: f32,
     water_tint: vec4<f32>,
     park_tint: vec4<f32>,
     building_tint: vec4<f32>,
@@ -34,12 +34,17 @@ struct VertexInput {
     @location(1) pixel_offset: vec2<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
+    /// 0.0 = large label (state/city/district/marker) — uses camera.label_alpha.
+    /// 1.0 = small label (street/building/poi/park) — additionally multiplied
+    /// by camera.small_label_alpha so it can fade out with the z14 tiles.
+    @location(4) kind_flag: f32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) kind_flag: f32,
 };
 
 @vertex
@@ -61,6 +66,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.clip_position = vec4<f32>(final_pos, 0.0, 1.0);
     out.uv = in.uv;
     out.color = in.color;
+    out.kind_flag = in.kind_flag;
 
     return out;
 }
@@ -91,7 +97,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // label_alpha is <1.0 during camera motion to hide the lag between the
     // gesture and the label rebuild; fades smoothly back to 1.0 on settle.
-    let alpha = (a0 + a1 + a2 + a3) * 0.25 * in.color.a * camera.label_alpha;
+    // small_label_alpha additionally fades out small (Street/Building/POI/Park)
+    // labels when the camera zooms out past LOW_ZOOM_THRESHOLD; selected by the
+    // per-vertex kind_flag.
+    let kind_mult = mix(1.0, camera.small_label_alpha, in.kind_flag);
+    let alpha = (a0 + a1 + a2 + a3) * 0.25 * in.color.a * camera.label_alpha * kind_mult;
 
     if alpha < 0.01 {
         discard;

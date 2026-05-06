@@ -11,8 +11,8 @@ struct CameraUniform {
     cloud_opacity: f32,
     cloud_speed: f32,
     label_alpha: f32,
+    small_label_alpha: f32,
     _pad2b: f32,
-    _pad2c: f32,
     water_tint: vec4<f32>,
     park_tint: vec4<f32>,
     building_tint: vec4<f32>,
@@ -71,14 +71,23 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
-// Tile fade-in: ramps from 0 → 1 over ~400 ms from each vertex's birth time.
-// If birth_time is 0 (legacy/single-shot path) the tile is always fully visible.
+// Tile alpha animation. Encoding of `birth_time`:
+//   == 0  → legacy single-shot path; always fully visible.
+//   >  0  → tile born at this time; fade in over 400 ms.
+//   <  0  → tile dying; death_time = -birth_time, fade out over 600 ms.
+// The CPU-side LoadedTile rewrites the per-vertex birth_buffer when it
+// transitions between these states (e.g. zoom drops below threshold).
 fn tile_fade(birth_time: f32, now: f32) -> f32 {
-    if birth_time <= 0.0 {
+    if birth_time == 0.0 {
         return 1.0;
     }
-    let age = now - birth_time;
-    return smoothstep(0.0, 0.4, age);
+    if birth_time > 0.0 {
+        let age = now - birth_time;
+        return smoothstep(0.0, 0.4, age);
+    }
+    // Dying — death_time encoded as -birth_time.
+    let dying_age = now - (-birth_time);
+    return 1.0 - smoothstep(0.0, 0.6, dying_age);
 }
 
 // ============================================================
